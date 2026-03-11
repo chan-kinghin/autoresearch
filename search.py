@@ -1,0 +1,589 @@
+"""
+search.py — Fixed utilities for the autonomous research agent.
+
+Provides: LLM calls, search APIs (3 tiers), content extraction, evaluation.
+This file is not meant to be edited per-project; configure via env vars.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import httpx
+
+# ── Configuration ──────────────────────────────────────────────────────────
+
+MODEL = os.environ.get("AUTORESEARCH_MODEL", "claude-sonnet-4-20250514")
+MAX_TOKENS = int(os.environ.get("AUTORESEARCH_MAX_TOKENS", "4096"))
+TEMPERATURE = float(os.environ.get("AUTORESEARCH_TEMPERATURE", "0.3"))
+HTTP_TIMEOUT = int(os.environ.get("AUTORESEARCH_HTTP_TIMEOUT", "60"))
+LLM_TIMEOUT = int(os.environ.get("AUTORESEARCH_LLM_TIMEOUT", "120"))
+
+# ── Provider Routing ───────────────────────────────────────────────────────
+#
+# MODEL format: "provider/model-id" or just "model-id" (auto-detected)
+# Examples:
+#   "claude-sonnet-4-20250514"       → Anthropic
+#   "openai/gpt-4o"                  → OpenAI
+#   "deepseek/deepseek-chat"         → DeepSeek
+#   "gemini/gemini-2.0-flash"        → Google Gemini
+
+PROVIDER_CONFIG = {
+    "anthropic": {
+        "base_url": "https://api.anthropic.com/v1/messages",
+        "env_key": "ANTHROPIC_API_KEY",
+    },
+    "openai": {
+        "base_url": "https://api.openai.com/v1/chat/completions",
+        "env_key": "OPENAI_API_KEY",
+    },
+    "deepseek": {
+        "base_url": "https://api.deepseek.com/v1/chat/completions",
+        "env_key": "DEEPSEEK_API_KEY",
+    },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "env_key": "GOOGLE_API_KEY",
+    },
+}
+
+
+def _detect_provider(model: str) -> Tuple[str, str]:
+    """Detect provider from model string. Returns (provider, model_id)."""
+    if "/" in model:
+        provider, model_id = model.split("/", 1)
+        return provider, model_id
+
+    # Auto-detect by model name prefix
+    if model.startswith("claude"):
+        return "anthropic", model
+    if model.startswith("gpt") or model.startswith("o1") or model.startswith("o3"):
+        return "openai", model
+    if model.startswith("deepseek"):
+        return "deepseek", model
+    if model.startswith("gemini"):
+        return "gemini", model
+
+    # Default to OpenAI-compatible
+    return "openai", model
+
+
+# ── Data Types ─────────────────────────────────────────────────────────────
+
+
+@dataclass
+class SearchResult:
+    title: str
+    url: str
+    snippet: str
+    source: str  # "semantic_scholar", "arxiv", "duckduckgo", "metaso", etc.
+    authors: str = ""
+    year: str = ""
+    full_text: str = ""
+
+
+@dataclass
+class EvaluationResult:
+    coverage_score: float
+    questions_answered: List[str] = field(default_factory=list)
+    questions_remaining: List[str] = field(default_factory=list)
+    gaps: List[str] = field(default_factory=list)
+    suggested_queries: List[str] = field(default_factory=list)
+
+
+@dataclass
+class IterationLog:
+    iteration: int
+    coverage: float
+    sources: int
+    duration_s: float
+    status: str  # "continue", "target_reached", "max_iterations", "error"
+
+
+# ── LLM Calls ─────────────────────────────────────────────────────────────
+
+
+def _call_anthropic(
+    model_id: str, system: str, prompt: str, max_tokens: int, temperature: float
+) -> str:
+    """Call Anthropic Messages API."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set")
+
+    with httpx.Client(timeout=LLM_TIMEOUT) as client:
+        resp = client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model_id,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "system": system,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    content = data.get("content") or []
+    if not content or not isinstance(content[0], dict):
+        raise ValueError(f"Unexpected Anthropic response shape: {data!r:.200}")
+    return content[0].get("text", "").strip()
+
+
+def _call_openai_compatible(
+    base_url: str, api_key: str, model_id: str,
+    system: str, prompt: str, max_tokens: int, temperature: float,
+) -> str:
+    """Call any OpenAI-compatible chat completions API."""
+    with httpx.Client(timeout=LLM_TIMEOUT) as client:
+        resp = client.post(
+            base_url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model_id,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise ValueError(f"Unexpected OpenAI-compatible response: no choices in {data!r:.200}")
+    message = choices[0].get("message") or {}
+    return (message.get("content") or "").strip()
+
+
+def llm_call(
+    prompt: str,
+    system: str = "You are a research assistant.",
+    model: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+) -> str:
+    """Make a single LLM call. Auto-routes to the correct provider."""
+    model = model or MODEL
+    max_tok = max_tokens or MAX_TOKENS
+    temp = temperature if temperature is not None else TEMPERATURE
+
+    provider, model_id = _detect_provider(model)
+
+    if provider == "anthropic":
+        return _call_anthropic(model_id, system, prompt, max_tok, temp)
+
+    # All others use OpenAI-compatible format
+    config = PROVIDER_CONFIG.get(provider)
+    if config is None:
+        print(f"  [llm] Warning: unknown provider '{provider}', falling back to OpenAI-compatible format")
+        config = PROVIDER_CONFIG["openai"]
+    api_key = os.environ.get(config["env_key"], "")
+    if not api_key:
+        raise ValueError(f"{config['env_key']} not set for provider '{provider}'")
+
+    return _call_openai_compatible(
+        config["base_url"], api_key, model_id, system, prompt, max_tok, temp
+    )
+
+
+def llm_json(
+    prompt: str,
+    system: str = "You are a research assistant. Respond ONLY with valid JSON, no markdown fences.",
+    model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Make an LLM call and parse the response as JSON."""
+    raw = llm_call(prompt, system=system, model=model)
+    # Strip markdown code fences if present
+    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```\s*$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"LLM returned invalid JSON: {e} — raw response: {raw[:200]}") from e
+
+
+# ── Tier 1: Deep Research Services ─────────────────────────────────────────
+
+
+def search_metaso(query: str, mode: str = "research") -> List[SearchResult]:
+    """Search via 秘塔搜索 (Metaso) API. Requires METASO_API_KEY."""
+    api_key = os.environ.get("METASO_API_KEY")
+    if not api_key:
+        return []
+
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.post(
+                "https://metaso.cn/api/open/search",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"q": query, "mode": mode},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        results: List[SearchResult] = []
+        if "data" in data:
+            d = data["data"]
+            content = d.get("content")
+            if content and isinstance(content, str):
+                results.append(SearchResult(
+                    title=f"Metaso Research: {query}",
+                    url="https://metaso.cn",
+                    snippet=content[:500],
+                    source="metaso",
+                    full_text=content,
+                ))
+            for src in d.get("sources", []):
+                results.append(SearchResult(
+                    title=src.get("title", ""),
+                    url=src.get("url", ""),
+                    snippet=src.get("snippet", ""),
+                    source="metaso",
+                ))
+        return results
+    except Exception as e:
+        print(f"  [metaso] Error: {e}")
+        return []
+
+
+def search_perplexity(query: str) -> List[SearchResult]:
+    """Search via Perplexity sonar API. Requires PERPLEXITY_API_KEY."""
+    api_key = os.environ.get("PERPLEXITY_API_KEY")
+    if not api_key:
+        return []
+
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "sonar",
+                    "messages": [{"role": "user", "content": query}],
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        results: List[SearchResult] = []
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if content:
+            results.append(SearchResult(
+                title=f"Perplexity: {query}",
+                url="https://perplexity.ai",
+                snippet=content[:500],
+                source="perplexity",
+                full_text=content,
+            ))
+        for citation in data.get("citations", []):
+            if isinstance(citation, str):
+                results.append(SearchResult(
+                    title=citation, url=citation, snippet="", source="perplexity"
+                ))
+        return results
+    except Exception as e:
+        print(f"  [perplexity] Error: {e}")
+        return []
+
+
+def search_gemini_deep(query: str) -> List[SearchResult]:
+    """Use Gemini as a deep research service. Requires GOOGLE_API_KEY."""
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return []
+
+    try:
+        content = _call_openai_compatible(
+            PROVIDER_CONFIG["gemini"]["base_url"],
+            api_key,
+            "gemini-2.0-flash",
+            "You are a research assistant. Provide a thorough, well-sourced answer.",
+            f"Research the following topic thoroughly:\n\n{query}",
+            4096,
+            0.3,
+        )
+        if content:
+            return [SearchResult(
+                title=f"Gemini Research: {query}",
+                url="https://gemini.google.com",
+                snippet=content[:500],
+                source="gemini",
+                full_text=content,
+            )]
+        return []
+    except Exception as e:
+        print(f"  [gemini] Error: {e}")
+        return []
+
+
+# ── Tier 2: Academic APIs ──────────────────────────────────────────────────
+
+
+def search_semantic_scholar(
+    query: str, limit: int = 10, year: Optional[str] = None,
+) -> List[SearchResult]:
+    """Search Semantic Scholar (no API key required, rate-limited)."""
+    try:
+        params: Dict[str, Any] = {
+            "query": query,
+            "limit": limit,
+            "fields": "title,authors,year,abstract,url,externalIds",
+        }
+        if year:
+            params["year"] = year
+
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.get(
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                params=params,
+            )
+            if resp.status_code == 429:
+                for attempt, wait in enumerate([3, 6], start=1):
+                    print(f"  [semantic_scholar] Rate limited, waiting {wait}s (attempt {attempt})...")
+                    time.sleep(wait)
+                    resp = client.get(
+                        "https://api.semanticscholar.org/graph/v1/paper/search",
+                        params=params,
+                    )
+                    if resp.status_code != 429:
+                        break
+            resp.raise_for_status()
+            data = resp.json()
+
+        results: List[SearchResult] = []
+        for paper in data.get("data", []):
+            authors = ", ".join(a.get("name", "") for a in paper.get("authors", []))
+            paper_url = paper.get("url", "")
+            if not paper_url and paper.get("externalIds", {}).get("DOI"):
+                paper_url = f"https://doi.org/{paper['externalIds']['DOI']}"
+            results.append(SearchResult(
+                title=paper.get("title", ""),
+                url=paper_url,
+                snippet=paper.get("abstract", "") or "",
+                source="semantic_scholar",
+                authors=authors,
+                year=str(paper.get("year", "")),
+            ))
+        return results
+    except Exception as e:
+        print(f"  [semantic_scholar] Error: {e}")
+        return []
+
+
+def search_arxiv(query: str, max_results: int = 10) -> List[SearchResult]:
+    """Search arXiv via its Atom API (no API key required)."""
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.get(
+                "https://export.arxiv.org/api/query",
+                params={
+                    "search_query": f"all:{query}",
+                    "start": 0,
+                    "max_results": max_results,
+                    "sortBy": "relevance",
+                    "sortOrder": "descending",
+                },
+            )
+            resp.raise_for_status()
+
+        root = ET.fromstring(resp.text)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+        results: List[SearchResult] = []
+        for entry in root.findall("atom:entry", ns):
+            title = entry.findtext("atom:title", "", ns).strip().replace("\n", " ")
+            summary = entry.findtext("atom:summary", "", ns).strip().replace("\n", " ")
+            link = ""
+            for lnk in entry.findall("atom:link", ns):
+                if lnk.get("type") == "text/html" or lnk.get("rel") == "alternate":
+                    link = lnk.get("href", "")
+                    break
+            authors = ", ".join(
+                a.findtext("atom:name", "", ns)
+                for a in entry.findall("atom:author", ns)
+            )
+            published = (entry.findtext("atom:published", "", ns) or "")[:4]
+
+            results.append(SearchResult(
+                title=title,
+                url=link,
+                snippet=summary[:500],
+                source="arxiv",
+                authors=authors,
+                year=published,
+            ))
+        return results
+    except Exception as e:
+        print(f"  [arxiv] Error: {e}")
+        return []
+
+
+# ── Tier 3: Web Search ─────────────────────────────────────────────────────
+
+
+def search_duckduckgo(query: str, max_results: int = 10) -> List[SearchResult]:
+    """Search DuckDuckGo (no API key required)."""
+    try:
+        from duckduckgo_search import DDGS
+
+        results: List[SearchResult] = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append(SearchResult(
+                    title=r.get("title", ""),
+                    url=r.get("href", ""),
+                    snippet=r.get("body", ""),
+                    source="duckduckgo",
+                ))
+        return results
+    except Exception as e:
+        print(f"  [duckduckgo] Error: {e}")
+        return []
+
+
+# ── Content Extraction ─────────────────────────────────────────────────────
+
+
+def extract_webpage(url: str) -> str:
+    """Extract main text content from a webpage using trafilatura."""
+    try:
+        import trafilatura
+
+        with httpx.Client(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+        text = trafilatura.extract(resp.text)
+        return text or ""
+    except httpx.HTTPStatusError as e:
+        print(f"  [extract] HTTP {e.response.status_code} for {url}")
+        return ""
+    except httpx.ConnectError as e:
+        print(f"  [extract] Connection failed for {url}: {e}")
+        return ""
+    except Exception as e:
+        print(f"  [extract] Error extracting {url}: {type(e).__name__}: {e}")
+        return ""
+
+
+# ── Unified Search ─────────────────────────────────────────────────────────
+
+
+def execute_searches(
+    queries: List[Dict[str, Any]],
+) -> List[SearchResult]:
+    """Execute a list of search plans. Each plan: {"query": str, "sources": [str]}.
+
+    Valid sources: "metaso", "perplexity", "gemini", "semantic_scholar", "arxiv", "duckduckgo"
+    """
+    all_results: List[SearchResult] = []
+    seen_urls: Set[str] = set()
+
+    dispatch = {
+        "metaso": search_metaso,
+        "perplexity": search_perplexity,
+        "gemini": search_gemini_deep,
+        "semantic_scholar": search_semantic_scholar,
+        "arxiv": search_arxiv,
+        "duckduckgo": search_duckduckgo,
+    }
+
+    for plan in queries:
+        query = plan["query"]
+        sources = plan.get("sources", ["duckduckgo"])
+        for src in sources:
+            fn = dispatch.get(src)
+            if not fn:
+                print(f"  [search] Unknown source: {src}")
+                continue
+            print(f"  Searching {src}: {query[:60]}...")
+            results = fn(query)
+            for r in results:
+                if r.url and r.url in seen_urls:
+                    continue
+                if r.url:
+                    seen_urls.add(r.url)
+                all_results.append(r)
+
+    return all_results
+
+
+# ── Evaluation ─────────────────────────────────────────────────────────────
+
+
+def evaluate_coverage(
+    research_program: str,
+    findings: str,
+) -> EvaluationResult:
+    """Use LLM-as-judge to evaluate how well findings cover the research program."""
+    prompt = f"""Evaluate how well the current research findings answer the research program.
+
+## Research Program
+{research_program}
+
+## Current Findings
+{findings}
+
+## Instructions
+Score coverage from 0.0 (nothing answered) to 1.0 (fully answered).
+Be strict — only score high if findings are thorough with supporting evidence.
+
+Respond with JSON only:
+{{
+  "coverage_score": <float 0.0-1.0>,
+  "questions_answered": ["list of questions that are well-answered"],
+  "questions_remaining": ["list of questions still unanswered or poorly answered"],
+  "gaps": ["specific knowledge gaps identified"],
+  "suggested_queries": ["2-4 search queries to fill the gaps"]
+}}"""
+
+    try:
+        data = llm_json(prompt)
+        return EvaluationResult(
+            coverage_score=float(data.get("coverage_score", 0.0)),
+            questions_answered=data.get("questions_answered", []),
+            questions_remaining=data.get("questions_remaining", []),
+            gaps=data.get("gaps", []),
+            suggested_queries=data.get("suggested_queries", []),
+        )
+    except Exception as e:
+        print(f"  [evaluate] Error: {e}")
+        return EvaluationResult(coverage_score=0.0, gaps=[str(e)])
+
+
+# ── Progress Logging ───────────────────────────────────────────────────────
+
+
+def init_progress_log(path: str = "progress.tsv") -> None:
+    """Create or reset the progress log file."""
+    try:
+        with open(path, "w") as f:
+            f.write("iteration\tcoverage\tsources\tduration_s\tstatus\n")
+    except OSError as e:
+        print(f"  [log] Warning: could not create progress log {path}: {e}")
+
+
+def log_iteration(log: IterationLog, path: str = "progress.tsv") -> None:
+    """Append an iteration log entry."""
+    try:
+        with open(path, "a") as f:
+            f.write(f"{log.iteration}\t{log.coverage:.2f}\t{log.sources}\t{log.duration_s:.1f}\t{log.status}\n")
+    except OSError as e:
+        print(f"  [log] Warning: could not write to progress log {path}: {e}")
