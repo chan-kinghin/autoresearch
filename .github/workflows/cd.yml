@@ -16,7 +16,7 @@ jobs:
         with:
           host: ${{ secrets.CVM_HOST }}
           username: ${{ secrets.CVM_USER }}
-          key: ${{ secrets.CVM_SSH_KEY }}
+          password: ${{ secrets.CVM_PASSWORD }}
           timeout: 300s
           script: |
             cd /opt/ops/apps/autoresearch/prod
