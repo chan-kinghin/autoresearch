@@ -5,6 +5,10 @@ __pycache__/
 findings.md
 progress.tsv
 research_store/
+runs/
 *.egg-info/
 dist/
 build/
+uv.lock
+*.bak
+.pytest_cache/

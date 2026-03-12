@@ -1,0 +1,45 @@
+services:
+  streamlit:
+    build: .
+    container_name: autoresearch-streamlit
+    restart: unless-stopped
+    ports:
+      - "8030:8501"
+    env_file:
+      - /opt/ops/secrets/autoresearch/prod.env
+    networks:
+      - default
+      - ops-infra
+    volumes:
+      - research-data:/app/runs
+      - research-data:/app/research_store
+    command: >
+      uv run streamlit run app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+
+  wecom-bot:
+    build: .
+    container_name: autoresearch-wecom-bot
+    restart: unless-stopped
+    ports:
+      - "8031:8765"
+    env_file:
+      - /opt/ops/secrets/autoresearch/prod.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - default
+      - ops-infra
+    volumes:
+      - research-data:/app/runs
+      - research-data:/app/research_store
+    command: uv run python wecom_bot.py --port 8765 --host 0.0.0.0
+
+volumes:
+  research-data:
+
+networks:
+  ops-infra:
+    external: true
