@@ -23,16 +23,6 @@ jobs:
             git fetch origin main
             git reset --hard origin/main
 
-            # One-time migration: copy old research-data volume to new split volumes
-            if docker volume inspect prod_research-data >/dev/null 2>&1; then
-              echo "Migrating old research-data volume..."
-              docker run --rm \
-                -v prod_research-data:/old \
-                -v prod_research-runs:/new \
-                alpine sh -c "cp -a /old/. /new/ 2>/dev/null || true"
-              echo "Migration done. Old volume preserved as prod_research-data."
-            fi
-
             docker compose build --no-cache
             docker compose up -d
             echo "Deploy complete: $(date)"
