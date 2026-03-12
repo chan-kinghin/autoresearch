@@ -7,12 +7,19 @@ services:
       - "8030:8501"
     env_file:
       - /opt/ops/secrets/autoresearch/prod.env
+    environment:
+      - PYTHONUNBUFFERED=1
     networks:
       - default
       - ops-infra
     volumes:
-      - research-data:/app/runs
-      - research-data:/app/research_store
+      - research-runs:/app/runs
+      - research-store:/app/research_store
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
     command: >
       uv run streamlit run app.py
       --server.port=8501
@@ -33,12 +40,18 @@ services:
       - default
       - ops-infra
     volumes:
-      - research-data:/app/runs
-      - research-data:/app/research_store
+      - research-runs:/app/runs
+      - research-store:/app/research_store
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
     command: uv run python wecom_bot.py --port 8765 --host 0.0.0.0
 
 volumes:
-  research-data:
+  research-runs:
+  research-store:
 
 networks:
   ops-infra:

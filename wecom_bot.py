@@ -37,9 +37,11 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse, unquote
 
 import httpx
@@ -58,8 +60,28 @@ BOT_KEY = os.environ.get("WECOM_BOT_KEY", "")
 DEFAULT_MODEL = os.environ.get("AUTORESEARCH_MODEL", "deepseek-chat")
 DEFAULT_MAX_ITER = int(os.environ.get("AUTORESEARCH_MAX_ITER", "5"))
 
-# Track running tasks to prevent duplicates
-_running_tasks: dict[str, bool] = {}
+DEBUG = os.environ.get("WECOM_BOT_DEBUG", "").lower() in ("1", "true", "yes")
+MAX_CONCURRENT_TASKS = 3
+MAX_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
+
+
+# ── Task tracking ────────────────────────────────────────────────────────
+
+
+@dataclass
+class TaskInfo:
+    topic: str
+    proc: subprocess.Popen | None
+    thread: threading.Thread | None
+    from_user: str
+    webhook_key: str
+    response_url: str
+    start_time: float
+    work_dir: Path
+
+
+_running_tasks: dict[str, TaskInfo] = {}
+_tasks_lock = threading.Lock()
 
 
 # ── WeCom Message Crypto ─────────────────────────────────────────────────
@@ -288,29 +310,73 @@ def generate_research_program(topic: str) -> str:
 """
 
 
-def run_research_async(topic: str, webhook_key: str, from_user: str = "") -> None:
-    """Run research in a background thread and send results to WeCom."""
-    task_key = topic[:50]
-    if _running_tasks.get(task_key):
-        send_wecom_text(webhook_key, f"⏳ 「{topic}」正在研究中，请稍候...")
-        return
+def _check_and_send_progress(
+    work_dir: Path, webhook_key: str, topic: str, last_lines: int,
+) -> int:
+    """Check progress.tsv and send update if new lines appeared. Returns updated last_lines."""
+    progress_path = work_dir / "progress.tsv"
+    if not progress_path.exists():
+        return last_lines
+    try:
+        lines = progress_path.read_text(encoding="utf-8").strip().split("\n")
+    except OSError:
+        return last_lines
+    if len(lines) > last_lines and len(lines) > 1:
+        last_lines = len(lines)
+        parts = lines[-1].split("\t")
+        iteration = len(lines) - 1
+        coverage = parts[1] if len(parts) >= 2 else "?"
+        send_wecom_text(webhook_key, f"📊 「{topic}」进度: 第{iteration}轮, 覆盖率 {coverage}")
+    return last_lines
 
-    _running_tasks[task_key] = True
+
+def run_research_async(
+    topic: str, webhook_key: str, from_user: str = "", response_url: str = "",
+) -> None:
+    """Run research in a background thread and send results to WeCom."""
+    task_key = topic if len(topic) <= 80 else topic[:40] + "..." + hashlib.md5(topic.encode()).hexdigest()[:8]
+
+    with _tasks_lock:
+        if task_key in _running_tasks:
+            send_wecom_text(webhook_key, f"⏳ 「{topic}」正在研究中，请稍候...")
+            return
+        if len(_running_tasks) >= MAX_CONCURRENT_TASKS:
+            reply_message(
+                f"⚠️ 当前已有 {len(_running_tasks)} 个任务运行中，请等待完成或取消后再试",
+                response_url, webhook_key,
+            )
+            return
+
+    # Create isolated work directory upfront
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + task_key[:20].replace(" ", "_")
+    work_dir = RUNS_DIR / run_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write research program into work_dir
+    program = generate_research_program(topic)
+    program_path = work_dir / "research_program.md"
+    program_path.write_text(program, encoding="utf-8")
+
+    task_info = TaskInfo(
+        topic=topic,
+        proc=None,
+        thread=None,
+        from_user=from_user,
+        webhook_key=webhook_key,
+        response_url=response_url,
+        start_time=time.time(),
+        work_dir=work_dir,
+    )
+
+    with _tasks_lock:
+        _running_tasks[task_key] = task_info
 
     def _run():
         try:
-            send_wecom_markdown(webhook_key, f"**🔬 开始研究**\n\n> {topic}\n\n模型: `{DEFAULT_MODEL}`\n最大迭代: {DEFAULT_MAX_ITER}")
-
-            program = generate_research_program(topic)
-            program_path = PROJECT_DIR / "research_program.md"
-            program_path.write_text(program, encoding="utf-8")
-
-            findings_path = PROJECT_DIR / "findings.md"
-            progress_path = PROJECT_DIR / "progress.tsv"
-            if findings_path.exists():
-                findings_path.unlink()
-            if progress_path.exists():
-                progress_path.unlink()
+            send_wecom_markdown(
+                webhook_key,
+                f"**🔬 开始研究**\n\n> {topic}\n\n模型: `{DEFAULT_MODEL}`\n最大迭代: {DEFAULT_MAX_ITER}",
+            )
 
             env = os.environ.copy()
             env["AUTORESEARCH_MODEL"] = DEFAULT_MODEL
@@ -325,22 +391,64 @@ def run_research_async(topic: str, webhook_key: str, from_user: str = "") -> Non
             ]
 
             start = time.time()
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                cwd=str(PROJECT_DIR), env=env, timeout=3600,
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd=str(work_dir), env=env,
             )
+
+            # Store proc handle in TaskInfo
+            with _tasks_lock:
+                if task_key in _running_tasks:
+                    _running_tasks[task_key].proc = proc
+
+            # Poll loop: check process, cancellation, and progress
+            deadline = time.time() + 3600
+            last_lines = 0
+            while proc.poll() is None:
+                # Check if cancelled
+                with _tasks_lock:
+                    if task_key not in _running_tasks:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
+                        return  # Cancelled
+
+                # Poll progress
+                last_lines = _check_and_send_progress(work_dir, webhook_key, topic, last_lines)
+
+                # Check timeout
+                if time.time() > deadline:
+                    proc.kill()
+                    proc.wait()
+                    # Try to send partial results
+                    partial_findings = work_dir / "findings.md"
+                    if partial_findings.exists():
+                        findings = partial_findings.read_text(encoding="utf-8")
+                        if findings.strip():
+                            send_wecom_markdown(webhook_key, f"**⏰ 研究超时（1小时），以下为部分结果**\n\n> {topic}\n\n---\n\n{findings}")
+                            send_wecom_file(webhook_key, partial_findings)
+                            if from_user:
+                                send_wecom_text(webhook_key, f"@{from_user} 研究超时但已有部分结果", mentioned=[from_user])
+                            return
+                    send_wecom_text(webhook_key, f"⏰ 研究超时（1小时）: {topic}")
+                    return
+
+                time.sleep(15)
+
+            # Process finished — read output
+            stdout = proc.stdout.read() if proc.stdout else ""
+            stderr = proc.stderr.read() if proc.stderr else ""
             elapsed = time.time() - start
 
-            if result.returncode == 0 and findings_path.exists():
+            findings_path = work_dir / "findings.md"
+            progress_path = work_dir / "progress.tsv"
+
+            if proc.returncode == 0 and findings_path.exists():
                 findings = findings_path.read_text(encoding="utf-8")
                 progress = progress_path.read_text(encoding="utf-8") if progress_path.exists() else ""
-
-                run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-                run_dir = RUNS_DIR / run_id
-                run_dir.mkdir(exist_ok=True)
-                (run_dir / "findings.md").write_text(findings, encoding="utf-8")
-                (run_dir / "progress.tsv").write_text(progress, encoding="utf-8")
-                (run_dir / "research_program.md").write_text(program, encoding="utf-8")
 
                 lines = progress.strip().split("\n")
                 iterations = len(lines) - 1 if len(lines) > 1 else 0
@@ -359,22 +467,37 @@ def run_research_async(topic: str, webhook_key: str, from_user: str = "") -> Non
                     f"- 运行ID: `{run_id}`\n\n"
                     f"---\n\n"
                 )
-                send_wecom_markdown(webhook_key, summary + findings)
-                send_wecom_file(webhook_key, run_dir / "findings.md")
-            else:
-                error_msg = result.stderr[-500:] if result.stderr else result.stdout[-500:]
-                send_wecom_text(webhook_key, f"❌ 研究失败\n\n{error_msg}")
+                reply_message(summary + findings, response_url, webhook_key)
+                send_wecom_file(webhook_key, findings_path)
+                progress_file = work_dir / "progress.tsv"
+                if progress_file.exists():
+                    send_wecom_file(webhook_key, progress_file)
 
-        except subprocess.TimeoutExpired:
-            send_wecom_text(webhook_key, f"⏰ 研究超时（1小时）: {topic}")
+                # Mention the user who started the research
+                if from_user:
+                    send_wecom_text(
+                        webhook_key,
+                        f"@{from_user} 你的研究「{topic}」已完成！",
+                        mentioned=[from_user],
+                    )
+            else:
+                error_detail = stderr[-300:] if stderr else stdout[-300:]
+                # Sanitize: extract last meaningful line instead of raw traceback
+                error_lines = [l.strip() for l in error_detail.strip().split("\n") if l.strip()]
+                last_line = error_lines[-1] if error_lines else "未知错误"
+                send_wecom_text(webhook_key, f"❌ 研究失败: {last_line}\n\n如需详细错误信息，请联系管理员。")
+
         except Exception as e:
-            send_wecom_text(webhook_key, f"❌ 研究出错: {e}")
+            print(f"[bot] Research error for '{topic}': {e}")
+            send_wecom_text(webhook_key, f"❌ 研究出错，请稍后重试。如持续失败请联系管理员。")
         finally:
-            _running_tasks.pop(task_key, None)
+            with _tasks_lock:
+                _running_tasks.pop(task_key, None)
 
     thread = threading.Thread(target=_run, daemon=True)
+    task_info.thread = thread
     thread.start()
-    print(f"[bot] Started research thread for: {topic}")
+    print(f"[bot] Started research thread for: {topic} (work_dir={work_dir})")
 
 
 # ── HTTP handler ─────────────────────────────────────────────────────────
@@ -384,6 +507,8 @@ HELP_TEXT = """🔬 **AutoResearch Bot**
 使用方法:
 - `研究 <主题>` — 启动自动研究
 - `状态` — 查看当前运行状态
+- `取消 <关键词>` — 取消运行中的任务
+- `历史` — 查看最近的研究记录
 - `帮助` — 显示此帮助信息
 
 示例: `研究 潜水蛙鞋设计`"""
@@ -471,7 +596,7 @@ def reply_message(text: str, response_url: str = "", webhook_key: str = "") -> b
 
 INTRO_TEXT = """**🔬 研究助手 — AutoResearch Bot**
 
-我是一个**自主研究 AI 助手**，能帮你深度调研任何主题。直接发送主题即可开始。
+我是一个**自主研究 AI 助手**，能帮你深度调研任何主题。发送 `研究 <主题>` 即可开始。
 
 **与传统搜索的区别：**
 - 🔍 **vs 秘塔(Metaso)**：Metaso 搜一次就出结果；我会**多轮迭代**，每轮评估"还缺什么"再针对性补充
@@ -503,6 +628,7 @@ INTRO_TEXT = """**🔬 研究助手 — AutoResearch Bot**
 - `研究 <主题>` — 发起研究，例如：`研究 碳纤维在消费电子中的应用趋势`
 - `状态` — 查看进行中的任务
 - `取消 <关键词>` — 取消运行中的任务
+- `历史` — 查看最近的研究记录
 - `帮助` — 显示本说明"""
 
 
@@ -516,46 +642,87 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
         reply_message(INTRO_TEXT, response_url, webhook_key)
 
     elif text_lower in ("状态", "status"):
-        if _running_tasks:
-            tasks = "\n".join(f"- {k}" for k in _running_tasks)
-            reply_message(f"🔄 正在运行的任务:\n{tasks}", response_url, webhook_key)
+        with _tasks_lock:
+            if _running_tasks:
+                items = []
+                for k, info in _running_tasks.items():
+                    elapsed = time.time() - info.start_time
+                    items.append(f"- {k} (by {info.from_user}, {elapsed:.0f}s)")
+                tasks_str = "\n".join(items)
+            else:
+                tasks_str = ""
+        if tasks_str:
+            reply_message(f"🔄 正在运行的任务:\n{tasks_str}", response_url, webhook_key)
         else:
             reply_message("✅ 当前没有运行中的任务", response_url, webhook_key)
 
     elif "取消" in text_lower or text_lower.startswith("cancel"):
         # Cancel a running task by substring match
-        if not _running_tasks:
+        with _tasks_lock:
+            task_keys = list(_running_tasks.keys())
+
+        if not task_keys:
             reply_message("✅ 当前没有运行中的任务", response_url, webhook_key)
         else:
             # Extract cancel target: remove command words, match against running tasks
             cancel_query = text_lower.replace("取消", "").replace("cancel", "").replace("我想", "").replace("请", "").strip()
             if not cancel_query:
                 # No specific target — list tasks for user to pick
-                tasks = "\n".join(f"- {k}" for k in _running_tasks)
+                tasks = "\n".join(f"- {k}" for k in task_keys)
                 reply_message(f"请指定要取消的任务，当前运行中:\n{tasks}\n\n例如: `取消 蛙鞋`", response_url, webhook_key)
             else:
                 # Find matching task by substring
-                matched = [k for k in _running_tasks if cancel_query in k.lower()]
+                matched = [k for k in task_keys if cancel_query in k.lower()]
                 if len(matched) == 1:
-                    _running_tasks.pop(matched[0], None)
-                    reply_message(f"🛑 已标记取消任务「{matched[0]}」\n\n注意：正在运行的子进程将在当前迭代结束后停止", response_url, webhook_key)
+                    matched_key = matched[0]
+                    with _tasks_lock:
+                        task = _running_tasks.get(matched_key)
+                        if task and task.proc:
+                            task.proc.terminate()
+                        _running_tasks.pop(matched_key, None)
+                    reply_message(f"🛑 已取消任务「{matched_key}」", response_url, webhook_key)
                 elif len(matched) > 1:
                     tasks = "\n".join(f"- {k}" for k in matched)
                     reply_message(f"匹配到多个任务，请更具体:\n{tasks}", response_url, webhook_key)
                 else:
-                    tasks = "\n".join(f"- {k}" for k in _running_tasks)
+                    tasks = "\n".join(f"- {k}" for k in task_keys)
                     reply_message(f"未找到匹配「{cancel_query}」的任务。当前运行中:\n{tasks}", response_url, webhook_key)
 
-    elif text_lower.startswith(("研究 ", "研究\n", "research ")):
-        topic = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+    elif text_lower in ("历史", "history", "结果", "列表"):
+        runs = sorted(RUNS_DIR.iterdir(), reverse=True)[:10] if RUNS_DIR.exists() else []
+        if runs:
+            items = []
+            for r in runs:
+                if not r.is_dir():
+                    continue
+                program = r / "research_program.md"
+                if program.exists():
+                    first_line = program.read_text(encoding="utf-8").split("\n")[0]
+                    topic = first_line.replace("# Research Program: ", "")
+                    items.append(f"- `{r.name}` — {topic}")
+                else:
+                    items.append(f"- `{r.name}`")
+            if items:
+                reply_message("📋 最近的研究:\n" + "\n".join(items), response_url, webhook_key)
+            else:
+                reply_message("暂无历史研究记录", response_url, webhook_key)
+        else:
+            reply_message("暂无历史研究记录", response_url, webhook_key)
+
+    elif text_lower.startswith("研究") or text_lower.startswith("research "):
+        if text_lower.startswith(("研究 ", "研究\n", "research ")):
+            topic = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
+        elif text_lower.startswith("研究"):
+            topic = text[len("研究"):].strip()
+        else:
+            topic = ""
         if topic:
             reply_message(f"🔬 收到！开始研究「{topic}」...", response_url, webhook_key)
-            run_research_async(topic, webhook_key, from_user)
+            run_research_async(topic, webhook_key, from_user, response_url)
         else:
             reply_message("请提供研究主题，例如: `研究 潜水蛙鞋设计`", response_url, webhook_key)
 
     else:
-        # Unknown command — do NOT treat as research topic
         reply_message(
             f"🤔 不太理解「{text}」\n\n"
             "发起研究请使用: `研究 <主题>`\n"
@@ -564,6 +731,10 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
             "更多帮助: `帮助`",
             response_url, webhook_key,
         )
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 
 class WeComBotHandler(BaseHTTPRequestHandler):
@@ -609,11 +780,16 @@ class WeComBotHandler(BaseHTTPRequestHandler):
             else:
                 print(f"[bot] URL verification FAILED")
 
-        # Fallback: echo back (for testing without encryption)
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(echostr_decoded.encode() if echostr_decoded else b"ok")
+        # Crypto not configured or verification failed
+        if DEBUG:
+            # Allow in debug mode for testing
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(echostr_decoded.encode() if echostr_decoded else b"ok")
+        else:
+            self.send_response(403)
+            self.end_headers()
 
     def do_POST(self):
         """Handle incoming messages (encrypted)."""
@@ -624,6 +800,15 @@ class WeComBotHandler(BaseHTTPRequestHandler):
         nonce = params.get("nonce", [""])[0]
 
         content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > MAX_BODY_SIZE:
+            self.send_response(413)
+            self.end_headers()
+            return
+        if content_length == 0:
+            self.send_response(400)
+            self.end_headers()
+            return
+
         body = self.rfile.read(content_length).decode("utf-8")
 
         # Respond immediately (WeCom expects quick 200)
@@ -642,24 +827,22 @@ class WeComBotHandler(BaseHTTPRequestHandler):
                 print(f"[bot] Decrypted: {decrypted[:300]}...")
                 msg = _extract_message(decrypted)
                 if msg["text"]:
-                    webhook_key = BOT_KEY
-                    if msg["webhook_url"] and "key=" in msg["webhook_url"]:
-                        webhook_key = msg["webhook_url"].split("key=")[-1].split("&")[0]
-                    handle_message(msg["text"], msg["from_user"], msg["response_url"], webhook_key)
+                    handle_message(msg["text"], msg["from_user"], msg["response_url"], BOT_KEY)
                 else:
                     print(f"[bot] No text in message (type={msg['msg_type']})")
                 return
             else:
                 print(f"[bot] Decryption failed, trying plaintext")
 
-        # Fallback: try plaintext JSON (for testing)
-        try:
-            data = json.loads(body)
-            msg = _extract_message(body)
-            if msg["text"]:
-                handle_message(msg["text"], msg["from_user"], msg["response_url"], BOT_KEY)
-        except json.JSONDecodeError:
-            print(f"[bot] Cannot parse body: {body[:200]}")
+        # Fallback: try plaintext JSON (for testing only)
+        if DEBUG:
+            try:
+                data = json.loads(body)
+                msg = _extract_message(body)
+                if msg["text"]:
+                    handle_message(msg["text"], msg["from_user"], msg["response_url"], BOT_KEY)
+            except json.JSONDecodeError:
+                print(f"[bot] Cannot parse body: {body[:200]}")
 
     def log_message(self, format, *args):
         """Suppress default access logs."""
@@ -682,11 +865,13 @@ def main():
     if not BOT_KEY:
         print("⚠️  WECOM_BOT_KEY not set. Bot can receive but won't be able to send replies.")
 
-    server = HTTPServer((args.host, args.port), WeComBotHandler)
+    server = ThreadingHTTPServer((args.host, args.port), WeComBotHandler)
     print(f"🤖 WeCom bot listening on http://{args.host}:{args.port}")
     print(f"   Callback URL: https://research.szfluent.cn/callback")
     print(f"   Model: {DEFAULT_MODEL}")
     print(f"   Max iterations: {DEFAULT_MAX_ITER}")
+    print(f"   Max concurrent tasks: {MAX_CONCURRENT_TASKS}")
+    print(f"   Debug mode: {'on' if DEBUG else 'off'}")
     print(f"   Encryption: {'✅ enabled' if _crypt else '❌ disabled'}")
 
     try:

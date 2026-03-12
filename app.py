@@ -20,9 +20,6 @@ import streamlit as st
 # ── Paths ────────────────────────────────────────────────────────────────
 
 PROJECT_DIR = Path(__file__).parent
-RESEARCH_PROGRAM_PATH = PROJECT_DIR / "research_program.md"
-FINDINGS_PATH = PROJECT_DIR / "findings.md"
-PROGRESS_PATH = PROJECT_DIR / "progress.tsv"
 RUNS_DIR = PROJECT_DIR / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
@@ -96,24 +93,6 @@ def send_wecom_message(webhook_key: str, content: str) -> bool:
 # ── Run history ──────────────────────────────────────────────────────────
 
 
-def save_run(topic: str, findings: str, progress: str, program: str) -> str:
-    """Save a completed run to the runs directory. Returns run ID."""
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = RUNS_DIR / run_id
-    run_dir.mkdir(exist_ok=True)
-    (run_dir / "findings.md").write_text(findings, encoding="utf-8")
-    (run_dir / "progress.tsv").write_text(progress, encoding="utf-8")
-    (run_dir / "research_program.md").write_text(program, encoding="utf-8")
-    (run_dir / "meta.json").write_text(json.dumps({
-        "topic": topic,
-        "timestamp": run_id,
-        "model": model,
-        "max_iterations": max_iterations,
-        "target_coverage": target_coverage,
-    }, ensure_ascii=False), encoding="utf-8")
-    return run_id
-
-
 def list_runs() -> list[dict]:
     """List all saved runs, newest first."""
     runs = []
@@ -130,16 +109,18 @@ def list_runs() -> list[dict]:
 # ── Research runner ──────────────────────────────────────────────────────
 
 
-def run_research(program_text: str, status_container) -> tuple[bool, str]:
-    """Run research.py as a subprocess, streaming output to Streamlit."""
-    # Write research program
-    RESEARCH_PROGRAM_PATH.write_text(program_text, encoding="utf-8")
+def run_research(program_text: str, status_container) -> tuple[bool, str, Path]:
+    """Run research.py as a subprocess, streaming output to Streamlit.
 
-    # Clear previous outputs
-    if FINDINGS_PATH.exists():
-        FINDINGS_PATH.unlink()
-    if PROGRESS_PATH.exists():
-        PROGRESS_PATH.unlink()
+    Returns (success, output_log, work_dir).
+    """
+    # Create isolated per-run work directory
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    work_dir = RUNS_DIR / run_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write research program into work_dir
+    (work_dir / "research_program.md").write_text(program_text, encoding="utf-8")
 
     # Build environment
     env = os.environ.copy()
@@ -161,7 +142,7 @@ def run_research(program_text: str, status_container) -> tuple[bool, str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        cwd=str(PROJECT_DIR),
+        cwd=str(work_dir),
         env=env,
         bufsize=1,
     )
@@ -190,7 +171,7 @@ def run_research(program_text: str, status_container) -> tuple[bool, str]:
 
     success = process.returncode == 0
     full_output = "\n".join(output_lines)
-    return success, full_output
+    return success, full_output, work_dir
 
 
 # ── Main UI ──────────────────────────────────────────────────────────────
@@ -200,10 +181,13 @@ tab_new, tab_history = st.tabs(["📝 New Research", "📚 History"])
 # ── Tab: New Research ────────────────────────────────────────────────────
 
 with tab_new:
-    # Load existing program as default
+    # Load program from most recent run as default (if any)
     existing_program = ""
-    if RESEARCH_PROGRAM_PATH.exists():
-        existing_program = RESEARCH_PROGRAM_PATH.read_text(encoding="utf-8")
+    recent_runs = list_runs()
+    if recent_runs:
+        last_program_path = RUNS_DIR / recent_runs[0]["run_id"] / "research_program.md"
+        if last_program_path.exists():
+            existing_program = last_program_path.read_text(encoding="utf-8")
 
     topic = st.text_input("Research Topic", placeholder="e.g. 潜水蛙鞋设计")
 
@@ -269,14 +253,24 @@ with tab_new:
 
     if run_clicked:
         status_container = st.container()
-        success, output = run_research(program_text, status_container)
+        success, output, work_dir = run_research(program_text, status_container)
 
-        if success and FINDINGS_PATH.exists():
-            findings = FINDINGS_PATH.read_text(encoding="utf-8")
-            progress = PROGRESS_PATH.read_text(encoding="utf-8") if PROGRESS_PATH.exists() else ""
+        findings_path = work_dir / "findings.md"
+        progress_path = work_dir / "progress.tsv"
 
-            # Save to history
-            run_id = save_run(topic or "Untitled", findings, progress, program_text)
+        if success and findings_path.exists():
+            findings = findings_path.read_text(encoding="utf-8")
+            progress = progress_path.read_text(encoding="utf-8") if progress_path.exists() else ""
+
+            # Save metadata into the work_dir (which is already in runs/)
+            run_id = work_dir.name
+            (work_dir / "meta.json").write_text(json.dumps({
+                "topic": topic or "Untitled",
+                "timestamp": run_id,
+                "model": model,
+                "max_iterations": max_iterations,
+                "target_coverage": target_coverage,
+            }, ensure_ascii=False), encoding="utf-8")
             st.success(f"Research complete! Run saved as `{run_id}`")
 
             # Show findings
