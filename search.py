@@ -224,7 +224,12 @@ def llm_json(
 
 
 def search_metaso(query: str, mode: str = "research") -> List[SearchResult]:
-    """Search via 秘塔搜索 (Metaso) API. Requires METASO_API_KEY."""
+    """Search via 秘塔搜索 (Metaso) API. Requires METASO_API_KEY.
+
+    The API returns Server-Sent Events (SSE). We parse:
+      - "append-text" events → concatenated into full_text
+      - "set-reference" events → individual source results
+    """
     api_key = os.environ.get("METASO_API_KEY")
     if not api_key:
         return []
@@ -234,30 +239,43 @@ def search_metaso(query: str, mode: str = "research") -> List[SearchResult]:
             resp = client.post(
                 "https://metaso.cn/api/open/search",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"q": query, "mode": mode},
+                json={"question": query, "mode": mode},
             )
             resp.raise_for_status()
-            data = resp.json()
 
+        # Parse SSE stream
+        text_chunks: List[str] = []
+        references: List[Dict[str, Any]] = []
+        for line in resp.text.split("\n"):
+            if not line.startswith("data:") or "[DONE]" in line:
+                continue
+            try:
+                obj = json.loads(line[5:])
+                evt_type = obj.get("type")
+                if evt_type == "append-text":
+                    text_chunks.append(obj.get("text", ""))
+                elif evt_type == "set-reference":
+                    references = obj.get("list", [])
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+        content = "".join(text_chunks)
         results: List[SearchResult] = []
-        if "data" in data:
-            d = data["data"]
-            content = d.get("content")
-            if content and isinstance(content, str):
-                results.append(SearchResult(
-                    title=f"Metaso Research: {query}",
-                    url="https://metaso.cn",
-                    snippet=content[:500],
-                    source="metaso",
-                    full_text=content,
-                ))
-            for src in d.get("sources", []):
-                results.append(SearchResult(
-                    title=src.get("title", ""),
-                    url=src.get("url", ""),
-                    snippet=src.get("snippet", ""),
-                    source="metaso",
-                ))
+        if content:
+            results.append(SearchResult(
+                title=f"Metaso Research: {query}",
+                url="https://metaso.cn",
+                snippet=content[:500],
+                source="metaso",
+                full_text=content,
+            ))
+        for ref in references:
+            results.append(SearchResult(
+                title=ref.get("title", ""),
+                url=ref.get("link", ""),
+                snippet=ref.get("title", ""),
+                source="metaso",
+            ))
         return results
     except Exception as e:
         print(f"  [metaso] Error: {e}")
