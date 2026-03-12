@@ -500,8 +500,10 @@ INTRO_TEXT = """**🔬 研究助手 — AutoResearch Bot**
 - 每个结论都附带来源链接
 
 **使用方法：**
-直接发送主题即可，例如：`碳纤维在消费电子中的应用趋势`
-输入 `状态` 查看进行中的任务"""
+- `研究 <主题>` — 发起研究，例如：`研究 碳纤维在消费电子中的应用趋势`
+- `状态` — 查看进行中的任务
+- `取消 <关键词>` — 取消运行中的任务
+- `帮助` — 显示本说明"""
 
 
 def handle_message(text: str, from_user: str, response_url: str = "", webhook_key: str = "") -> None:
@@ -520,6 +522,30 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
         else:
             reply_message("✅ 当前没有运行中的任务", response_url, webhook_key)
 
+    elif "取消" in text_lower or text_lower.startswith("cancel"):
+        # Cancel a running task by substring match
+        if not _running_tasks:
+            reply_message("✅ 当前没有运行中的任务", response_url, webhook_key)
+        else:
+            # Extract cancel target: remove command words, match against running tasks
+            cancel_query = text_lower.replace("取消", "").replace("cancel", "").replace("我想", "").replace("请", "").strip()
+            if not cancel_query:
+                # No specific target — list tasks for user to pick
+                tasks = "\n".join(f"- {k}" for k in _running_tasks)
+                reply_message(f"请指定要取消的任务，当前运行中:\n{tasks}\n\n例如: `取消 蛙鞋`", response_url, webhook_key)
+            else:
+                # Find matching task by substring
+                matched = [k for k in _running_tasks if cancel_query in k.lower()]
+                if len(matched) == 1:
+                    _running_tasks.pop(matched[0], None)
+                    reply_message(f"🛑 已标记取消任务「{matched[0]}」\n\n注意：正在运行的子进程将在当前迭代结束后停止", response_url, webhook_key)
+                elif len(matched) > 1:
+                    tasks = "\n".join(f"- {k}" for k in matched)
+                    reply_message(f"匹配到多个任务，请更具体:\n{tasks}", response_url, webhook_key)
+                else:
+                    tasks = "\n".join(f"- {k}" for k in _running_tasks)
+                    reply_message(f"未找到匹配「{cancel_query}」的任务。当前运行中:\n{tasks}", response_url, webhook_key)
+
     elif text_lower.startswith(("研究 ", "研究\n", "research ")):
         topic = text.split(None, 1)[1] if len(text.split(None, 1)) > 1 else ""
         if topic:
@@ -529,9 +555,15 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
             reply_message("请提供研究主题，例如: `研究 潜水蛙鞋设计`", response_url, webhook_key)
 
     else:
-        # Treat as research topic
-        reply_message(f"🔬 收到！开始研究「{text}」...\n\n（输入`帮助`查看更多功能）", response_url, webhook_key)
-        run_research_async(text, webhook_key, from_user)
+        # Unknown command — do NOT treat as research topic
+        reply_message(
+            f"🤔 不太理解「{text}」\n\n"
+            "发起研究请使用: `研究 <主题>`\n"
+            "查看任务状态: `状态`\n"
+            "取消任务: `取消 <关键词>`\n"
+            "更多帮助: `帮助`",
+            response_url, webhook_key,
+        )
 
 
 class WeComBotHandler(BaseHTTPRequestHandler):

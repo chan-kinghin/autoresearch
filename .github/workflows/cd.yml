@@ -1,0 +1,27 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to CVM
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Deploy autoresearch
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.CVM_HOST }}
+          username: ${{ secrets.CVM_USER }}
+          key: ${{ secrets.CVM_SSH_KEY }}
+          timeout: 300s
+          script: |
+            cd /opt/ops/apps/autoresearch/prod
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose build --no-cache wecom-bot
+            docker compose up -d wecom-bot
+            echo "Deploy complete: $(date)"
