@@ -578,16 +578,29 @@ def reply_via_response_url(response_url: str, content: str) -> bool:
             "markdown": {"content": content[:4000]},
         }, timeout=10)
         print(f"[bot] Reply via response_url: status={resp.status_code} body={resp.text[:200]}")
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            return False
+        # WeCom returns {"errcode": 0} on success; non-zero means failure
+        try:
+            result = resp.json()
+            errcode = result.get("errcode", 0)
+            if errcode != 0:
+                print(f"[bot] response_url returned errcode={errcode}: {result.get('errmsg', '')}")
+                return False
+        except (ValueError, AttributeError):
+            pass  # Non-JSON 200 response, treat as success
+        return True
     except Exception as e:
-        print(f"[bot] Reply error: {e}")
+        print(f"[bot] Reply via response_url error: {e}")
         return False
 
 
 def reply_message(text: str, response_url: str = "", webhook_key: str = "") -> bool:
-    """Reply using the best available method."""
+    """Reply using the best available method, with fallback."""
     if response_url:
-        return reply_via_response_url(response_url, text)
+        if reply_via_response_url(response_url, text):
+            return True
+        print(f"[bot] response_url failed, falling back to webhook")
     if webhook_key:
         return send_wecom_markdown(webhook_key, text)
     print(f"[bot] No reply method available")
@@ -824,12 +837,21 @@ class WeComBotHandler(BaseHTTPRequestHandler):
         if _crypt and msg_signature:
             ok, decrypted = _crypt.decrypt_msg(msg_signature, timestamp, nonce, body)
             if ok:
-                print(f"[bot] Decrypted: {decrypted[:300]}...")
+                print(f"[bot] Decrypted: {decrypted[:500]}...")
                 msg = _extract_message(decrypted)
+                # Use webhook_url from message as fallback for BOT_KEY
+                webhook_key = BOT_KEY
+                if not webhook_key and msg["webhook_url"]:
+                    # Extract key from full webhook URL
+                    wh_match = re.search(r'key=([^&]+)', msg["webhook_url"])
+                    if wh_match:
+                        webhook_key = wh_match.group(1)
                 if msg["text"]:
-                    handle_message(msg["text"], msg["from_user"], msg["response_url"], BOT_KEY)
+                    handle_message(msg["text"], msg["from_user"], msg["response_url"], webhook_key)
                 else:
-                    print(f"[bot] No text in message (type={msg['msg_type']})")
+                    print(f"[bot] No text in message (type={msg['msg_type']}, keys={msg.keys()})")
+                    if DEBUG:
+                        print(f"[bot]   Full decrypted content: {decrypted[:1000]}")
                 return
             else:
                 print(f"[bot] Decryption failed, trying plaintext")
