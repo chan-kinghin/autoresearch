@@ -391,10 +391,23 @@ def run_research_async(
             ]
 
             start = time.time()
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, cwd=str(work_dir), env=env,
-            )
+            stdout_log = work_dir / "stdout.log"
+            stderr_log = work_dir / "stderr.log"
+
+            # Write to log files instead of PIPE to avoid pipe buffer deadlock.
+            # research.py produces heavy output that fills the 64KB pipe buffer,
+            # blocking the subprocess forever.
+            fout = open(stdout_log, "w", encoding="utf-8")
+            ferr = open(stderr_log, "w", encoding="utf-8")
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=fout, stderr=ferr,
+                    cwd=str(work_dir), env=env,
+                )
+            except Exception:
+                fout.close()
+                ferr.close()
+                raise
 
             # Store proc handle in TaskInfo
             with _tasks_lock:
@@ -414,6 +427,8 @@ def run_research_async(
                         except subprocess.TimeoutExpired:
                             proc.kill()
                             proc.wait()
+                        fout.close()
+                        ferr.close()
                         return  # Cancelled
 
                 # Poll progress
@@ -423,6 +438,8 @@ def run_research_async(
                 if time.time() > deadline:
                     proc.kill()
                     proc.wait()
+                    fout.close()
+                    ferr.close()
                     # Try to send partial results
                     partial_findings = work_dir / "findings.md"
                     if partial_findings.exists():
@@ -438,9 +455,9 @@ def run_research_async(
 
                 time.sleep(15)
 
-            # Process finished — read output
-            stdout = proc.stdout.read() if proc.stdout else ""
-            stderr = proc.stderr.read() if proc.stderr else ""
+            # Process finished — close log files, then read for error reporting
+            fout.close()
+            ferr.close()
             elapsed = time.time() - start
 
             findings_path = work_dir / "findings.md"
@@ -469,9 +486,8 @@ def run_research_async(
                 )
                 reply_message(summary + findings, response_url, webhook_key)
                 send_wecom_file(webhook_key, findings_path)
-                progress_file = work_dir / "progress.tsv"
-                if progress_file.exists():
-                    send_wecom_file(webhook_key, progress_file)
+                if progress_path.exists():
+                    send_wecom_file(webhook_key, progress_path)
 
                 # Mention the user who started the research
                 if from_user:
@@ -481,10 +497,13 @@ def run_research_async(
                         mentioned=[from_user],
                     )
             else:
-                error_detail = stderr[-300:] if stderr else stdout[-300:]
-                # Sanitize: extract last meaningful line instead of raw traceback
+                # Read last 300 chars of stderr/stdout for error context
+                stderr_text = stderr_log.read_text(encoding="utf-8")[-300:] if stderr_log.exists() else ""
+                stdout_text = stdout_log.read_text(encoding="utf-8")[-300:] if stdout_log.exists() else ""
+                error_detail = stderr_text or stdout_text
                 error_lines = [l.strip() for l in error_detail.strip().split("\n") if l.strip()]
                 last_line = error_lines[-1] if error_lines else "未知错误"
+                print(f"[bot] Research failed (rc={proc.returncode}): {last_line}")
                 send_wecom_text(webhook_key, f"❌ 研究失败: {last_line}\n\n如需详细错误信息，请联系管理员。")
 
         except Exception as e:
