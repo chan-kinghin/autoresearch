@@ -75,13 +75,33 @@ class TaskInfo:
     thread: threading.Thread | None
     from_user: str
     webhook_key: str
-    response_url: str
     start_time: float
     work_dir: Path
 
 
 _running_tasks: dict[str, TaskInfo] = {}
 _tasks_lock = threading.Lock()
+
+# MsgId deduplication — WeCom retries callbacks, so we track recent message IDs
+_seen_msg_ids: dict[str, float] = {}  # msg_id -> timestamp
+_seen_msg_ids_lock = threading.Lock()
+_MSG_ID_TTL = 300  # 5 minutes
+
+
+def _is_duplicate_msg(msg_id: str) -> bool:
+    """Check if a message ID was already processed. Thread-safe."""
+    if not msg_id:
+        return False
+    now = time.time()
+    with _seen_msg_ids_lock:
+        # Prune expired entries
+        expired = [k for k, t in _seen_msg_ids.items() if now - t > _MSG_ID_TTL]
+        for k in expired:
+            del _seen_msg_ids[k]
+        if msg_id in _seen_msg_ids:
+            return True
+        _seen_msg_ids[msg_id] = now
+        return False
 
 
 # ── WeCom Message Crypto ─────────────────────────────────────────────────
@@ -230,7 +250,17 @@ def send_wecom_text(webhook_key: str, content: str, mentioned: list[str] | None 
         payload["text"]["mentioned_list"] = mentioned
     try:
         resp = httpx.post(url, json=payload, timeout=10)
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            print(f"[wecom] Send text HTTP {resp.status_code}")
+            return False
+        try:
+            result = resp.json()
+            if result.get("errcode", 0) != 0:
+                print(f"[wecom] Send text errcode={result['errcode']}: {result.get('errmsg', '')}")
+                return False
+        except (ValueError, AttributeError):
+            pass
+        return True
     except Exception as e:
         print(f"[wecom] Send error: {e}")
         return False
@@ -247,7 +277,17 @@ def send_wecom_markdown(webhook_key: str, content: str) -> bool:
             "msgtype": "markdown",
             "markdown": {"content": truncated},
         }, timeout=10)
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            print(f"[wecom] Send markdown HTTP {resp.status_code}")
+            return False
+        try:
+            result = resp.json()
+            if result.get("errcode", 0) != 0:
+                print(f"[wecom] Send markdown errcode={result['errcode']}: {result.get('errmsg', '')}")
+                return False
+        except (ValueError, AttributeError):
+            pass
+        return True
     except Exception as e:
         print(f"[wecom] Send error: {e}")
         return False
@@ -326,16 +366,22 @@ def _check_and_send_progress(
         parts = lines[-1].split("\t")
         iteration = len(lines) - 1
         coverage = parts[1] if len(parts) >= 2 else "?"
-        send_wecom_text(webhook_key, f"📊 「{topic}」进度: 第{iteration}轮, 覆盖率 {coverage}")
+        # Use webhook only — response_url expires after ~5s
+        reply_message(f"📊 「{topic}」进度: 第{iteration}轮, 覆盖率 {coverage}", webhook_key=webhook_key)
     return last_lines
 
 
 def run_research_async(
-    topic: str, webhook_key: str, from_user: str = "", response_url: str = "",
+    topic: str, webhook_key: str, from_user: str = "",
 ) -> None:
     """Run research in a background thread and send results to WeCom."""
     task_key = topic if len(topic) <= 80 else topic[:40] + "..." + hashlib.md5(topic.encode()).hexdigest()[:8]
 
+    # Create work directory before taking the lock (I/O outside lock)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + task_key[:20].replace(" ", "_")
+    work_dir = RUNS_DIR / run_id
+
+    # Atomic check-and-insert to prevent TOCTOU race
     with _tasks_lock:
         if task_key in _running_tasks:
             send_wecom_text(webhook_key, f"⏳ 「{topic}」正在研究中，请稍候...")
@@ -343,44 +389,34 @@ def run_research_async(
         if len(_running_tasks) >= MAX_CONCURRENT_TASKS:
             reply_message(
                 f"⚠️ 当前已有 {len(_running_tasks)} 个任务运行中，请等待完成或取消后再试",
-                response_url, webhook_key,
+                webhook_key=webhook_key,
             )
             return
-
-    # Create isolated work directory upfront
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + task_key[:20].replace(" ", "_")
-    work_dir = RUNS_DIR / run_id
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    # Write research program into work_dir
-    program = generate_research_program(topic)
-    program_path = work_dir / "research_program.md"
-    program_path.write_text(program, encoding="utf-8")
-
-    task_info = TaskInfo(
-        topic=topic,
-        proc=None,
-        thread=None,
-        from_user=from_user,
-        webhook_key=webhook_key,
-        response_url=response_url,
-        start_time=time.time(),
-        work_dir=work_dir,
-    )
-
-    with _tasks_lock:
+        # Insert immediately under the same lock — no TOCTOU window
+        task_info = TaskInfo(
+            topic=topic,
+            proc=None,
+            thread=None,
+            from_user=from_user,
+            webhook_key=webhook_key,
+            start_time=time.time(),
+            work_dir=work_dir,
+        )
         _running_tasks[task_key] = task_info
+
+    # Create work directory and research program (after lock released)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    program = generate_research_program(topic)
+    (work_dir / "research_program.md").write_text(program, encoding="utf-8")
 
     def _run():
         try:
-            send_wecom_markdown(
-                webhook_key,
-                f"**🔬 开始研究**\n\n> {topic}\n\n模型: `{DEFAULT_MODEL}`\n最大迭代: {DEFAULT_MAX_ITER}",
-            )
 
             env = os.environ.copy()
             env["AUTORESEARCH_MODEL"] = DEFAULT_MODEL
             env["PATH"] = str(Path.home() / ".local" / "bin") + ":" + env.get("PATH", "")
+            # Ensure research.py can find search.py and knowledge_store.py
+            env["PYTHONPATH"] = str(PROJECT_DIR) + ":" + env.get("PYTHONPATH", "")
 
             cmd = [
                 sys.executable, str(PROJECT_DIR / "research.py"),
@@ -404,60 +440,53 @@ def run_research_async(
                     cmd, stdout=fout, stderr=ferr,
                     cwd=str(work_dir), env=env,
                 )
-            except Exception:
-                fout.close()
-                ferr.close()
-                raise
 
-            # Store proc handle in TaskInfo
-            with _tasks_lock:
-                if task_key in _running_tasks:
-                    _running_tasks[task_key].proc = proc
-
-            # Poll loop: check process, cancellation, and progress
-            deadline = time.time() + 3600
-            last_lines = 0
-            while proc.poll() is None:
-                # Check if cancelled
+                # Store proc handle in TaskInfo
                 with _tasks_lock:
-                    if task_key not in _running_tasks:
+                    if task_key in _running_tasks:
+                        _running_tasks[task_key].proc = proc
+
+                # Poll loop: check process, cancellation, and progress
+                deadline = time.time() + 3600
+                last_lines = 0
+                while proc.poll() is None:
+                    # Check if cancelled
+                    with _tasks_lock:
+                        cancelled = task_key not in _running_tasks
+                    if cancelled:
                         proc.terminate()
                         try:
                             proc.wait(timeout=10)
                         except subprocess.TimeoutExpired:
                             proc.kill()
                             proc.wait()
-                        fout.close()
-                        ferr.close()
                         return  # Cancelled
 
-                # Poll progress
-                last_lines = _check_and_send_progress(work_dir, webhook_key, topic, last_lines)
+                    # Poll progress (webhook only — response_url expired)
+                    last_lines = _check_and_send_progress(work_dir, webhook_key, topic, last_lines)
 
-                # Check timeout
-                if time.time() > deadline:
-                    proc.kill()
-                    proc.wait()
-                    fout.close()
-                    ferr.close()
-                    # Try to send partial results
-                    partial_findings = work_dir / "findings.md"
-                    if partial_findings.exists():
-                        findings = partial_findings.read_text(encoding="utf-8")
-                        if findings.strip():
-                            send_wecom_markdown(webhook_key, f"**⏰ 研究超时（1小时），以下为部分结果**\n\n> {topic}\n\n---\n\n{findings}")
-                            send_wecom_file(webhook_key, partial_findings)
-                            if from_user:
-                                send_wecom_text(webhook_key, f"@{from_user} 研究超时但已有部分结果", mentioned=[from_user])
-                            return
-                    send_wecom_text(webhook_key, f"⏰ 研究超时（1小时）: {topic}")
-                    return
+                    # Check timeout
+                    if time.time() > deadline:
+                        proc.kill()
+                        proc.wait()
+                        # Try to send partial results
+                        partial_findings = work_dir / "findings.md"
+                        if partial_findings.exists():
+                            findings = partial_findings.read_text(encoding="utf-8")
+                            if findings.strip():
+                                send_wecom_markdown(webhook_key, f"**⏰ 研究超时（1小时），以下为部分结果**\n\n> {topic}\n\n---\n\n{findings}")
+                                send_wecom_file(webhook_key, partial_findings)
+                                if from_user:
+                                    send_wecom_text(webhook_key, f"@{from_user} 研究超时但已有部分结果", mentioned=[from_user])
+                                return
+                        send_wecom_text(webhook_key, f"⏰ 研究超时（1小时）: {topic}")
+                        return
 
-                time.sleep(15)
+                    time.sleep(15)
+            finally:
+                fout.close()
+                ferr.close()
 
-            # Process finished — close log files, then read for error reporting
-            fout.close()
-            ferr.close()
             elapsed = time.time() - start
 
             findings_path = work_dir / "findings.md"
@@ -484,7 +513,8 @@ def run_research_async(
                     f"- 运行ID: `{run_id}`\n\n"
                     f"---\n\n"
                 )
-                reply_message(summary + findings, response_url, webhook_key)
+                # response_url expired long ago — use webhook only
+                reply_message(summary + findings, webhook_key=webhook_key)
                 send_wecom_file(webhook_key, findings_path)
                 if progress_path.exists():
                     send_wecom_file(webhook_key, progress_path)
@@ -533,12 +563,23 @@ HELP_TEXT = """🔬 **AutoResearch Bot**
 示例: `研究 潜水蛙鞋设计`"""
 
 
+def _strip_at_mentions(text: str) -> str:
+    """Remove @mention prefixes from message text.
+
+    WeCom intelligent bots may include @BotName in the content field.
+    Patterns: '@BotName ', '@BotName\n', '@Someone ' etc.
+    """
+    # Remove leading @mentions (one or more)
+    stripped = re.sub(r'^(@\S+\s*)+', '', text).strip()
+    return stripped if stripped else text.strip()
+
+
 def _extract_message(decrypted: str) -> dict:
     """Extract message fields from decrypted content (XML or JSON).
 
     Returns dict with keys: text, from_user, response_url, webhook_url, msg_type
     """
-    result = {"text": "", "from_user": "", "response_url": "", "webhook_url": "", "msg_type": ""}
+    result = {"text": "", "from_user": "", "response_url": "", "webhook_url": "", "msg_type": "", "msg_id": ""}
 
     # Try JSON first
     try:
@@ -546,6 +587,7 @@ def _extract_message(decrypted: str) -> dict:
         print(f"[bot]   Decrypted JSON keys: {list(data.keys())}")
 
         result["msg_type"] = data.get("MsgType", data.get("msgtype", ""))
+        result["msg_id"] = str(data.get("MsgId", data.get("msgid", "")))
         result["response_url"] = data.get("ResponseUrl", data.get("response_url", ""))
         result["webhook_url"] = data.get("WebhookUrl", "")
 
@@ -569,6 +611,10 @@ def _extract_message(decrypted: str) -> dict:
         elif "content" in data:
             result["text"] = data["content"].strip()
 
+        # Strip @mention prefixes (WeCom may include @BotName in content)
+        if result["text"]:
+            result["text"] = _strip_at_mentions(result["text"])
+
         return result
     except (json.JSONDecodeError, ValueError):
         pass
@@ -577,6 +623,7 @@ def _extract_message(decrypted: str) -> dict:
     try:
         root = ET.fromstring(decrypted)
         result["msg_type"] = root.findtext("MsgType", "")
+        result["msg_id"] = root.findtext("MsgId", "")
         result["text"] = root.findtext("Content", "").strip()
         result["from_user"] = root.findtext("From/UserId", "") or root.findtext("FromUserName", "")
         result["webhook_url"] = root.findtext("WebhookUrl", "")
@@ -584,34 +631,45 @@ def _extract_message(decrypted: str) -> dict:
     except ET.ParseError:
         pass
 
+    # Strip @mention prefixes
+    if result["text"]:
+        result["text"] = _strip_at_mentions(result["text"])
+
     return result
 
 
 def reply_via_response_url(response_url: str, content: str) -> bool:
-    """Reply to a message using the intelligent bot's response_url (proactive reply)."""
+    """Reply to a message using the intelligent bot's response_url (proactive reply).
+
+    Tries markdown first, falls back to text if the bot doesn't support markdown.
+    """
     if not response_url:
         return False
-    try:
-        resp = httpx.post(response_url, json={
-            "msgtype": "markdown",
-            "markdown": {"content": content[:4000]},
-        }, timeout=10)
-        print(f"[bot] Reply via response_url: status={resp.status_code} body={resp.text[:200]}")
-        if resp.status_code != 200:
-            return False
-        # WeCom returns {"errcode": 0} on success; non-zero means failure
+
+    # Try markdown first, then text as fallback
+    attempts = [
+        {"msgtype": "markdown", "markdown": {"content": content[:4000]}},
+        {"msgtype": "text", "text": {"content": content[:2048]}},
+    ]
+    for payload in attempts:
         try:
-            result = resp.json()
-            errcode = result.get("errcode", 0)
-            if errcode != 0:
-                print(f"[bot] response_url returned errcode={errcode}: {result.get('errmsg', '')}")
-                return False
-        except (ValueError, AttributeError):
-            pass  # Non-JSON 200 response, treat as success
-        return True
-    except Exception as e:
-        print(f"[bot] Reply via response_url error: {e}")
-        return False
+            resp = httpx.post(response_url, json=payload, timeout=10)
+            print(f"[bot] Reply via response_url ({payload['msgtype']}): status={resp.status_code} body={resp.text[:200]}")
+            if resp.status_code != 200:
+                continue
+            try:
+                result = resp.json()
+                errcode = result.get("errcode", 0)
+                if errcode != 0:
+                    print(f"[bot] response_url errcode={errcode}: {result.get('errmsg', '')}")
+                    continue  # Try next format
+            except (ValueError, AttributeError):
+                pass  # Non-JSON 200, treat as success
+            return True
+        except Exception as e:
+            print(f"[bot] Reply via response_url error ({payload['msgtype']}): {e}")
+            continue
+    return False
 
 
 def reply_message(text: str, response_url: str = "", webhook_key: str = "") -> bool:
@@ -669,7 +727,32 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
     text_lower = text.lower().strip()
     print(f"[bot] Message from {from_user}: {text}")
 
-    if text_lower in ("帮助", "help", "?", "？", "你可以做什么", "你能做什么",
+    if text_lower in ("诊断", "diag", "debug", "test"):
+        # Diagnostic: test all reply methods
+        diag_lines = [f"**🔧 诊断报告**\n"]
+        diag_lines.append(f"- BOT_KEY: {'✅ set (' + BOT_KEY[:8] + '...)' if BOT_KEY else '❌ NOT SET'}")
+        diag_lines.append(f"- response_url: {'✅ present' if response_url else '❌ empty'}")
+        diag_lines.append(f"- Encryption: {'✅' if _crypt else '❌'}")
+        diag_lines.append(f"- Model: `{DEFAULT_MODEL}`")
+        diag_lines.append(f"- Max iterations: {DEFAULT_MAX_ITER}")
+
+        # Test response_url
+        if response_url:
+            ok = reply_via_response_url(response_url, "🔧 测试 response_url: OK")
+            diag_lines.append(f"- response_url 测试: {'✅ 成功' if ok else '❌ 失败'}")
+        # Test webhook
+        if webhook_key:
+            ok = send_wecom_text(webhook_key, "🔧 测试 webhook: OK")
+            diag_lines.append(f"- webhook 测试: {'✅ 成功' if ok else '❌ 失败'}")
+        elif BOT_KEY:
+            ok = send_wecom_text(BOT_KEY, "🔧 测试 webhook: OK")
+            diag_lines.append(f"- webhook 测试: {'✅ 成功' if ok else '❌ 失败'}")
+        else:
+            diag_lines.append(f"- webhook 测试: ⏭️ 跳过 (无 key)")
+
+        reply_message("\n".join(diag_lines), response_url, webhook_key)
+
+    elif text_lower in ("帮助", "help", "?", "？", "你可以做什么", "你能做什么",
                        "介绍", "你是谁", "hi", "hello", "你好"):
         reply_message(INTRO_TEXT, response_url, webhook_key)
 
@@ -708,10 +791,10 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
                 if len(matched) == 1:
                     matched_key = matched[0]
                     with _tasks_lock:
-                        task = _running_tasks.get(matched_key)
-                        if task and task.proc:
-                            task.proc.terminate()
-                        _running_tasks.pop(matched_key, None)
+                        task = _running_tasks.pop(matched_key, None)
+                    # Terminate outside lock to avoid blocking other threads
+                    if task and task.proc:
+                        task.proc.terminate()
                     reply_message(f"🛑 已取消任务「{matched_key}」", response_url, webhook_key)
                 elif len(matched) > 1:
                     tasks = "\n".join(f"- {k}" for k in matched)
@@ -750,19 +833,24 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
             topic = ""
         if topic:
             reply_message(f"🔬 收到！开始研究「{topic}」...", response_url, webhook_key)
-            run_research_async(topic, webhook_key, from_user, response_url)
+            run_research_async(topic, webhook_key, from_user)
         else:
             reply_message("请提供研究主题，例如: `研究 潜水蛙鞋设计`", response_url, webhook_key)
 
     else:
-        reply_message(
-            f"🤔 不太理解「{text}」\n\n"
-            "发起研究请使用: `研究 <主题>`\n"
-            "查看任务状态: `状态`\n"
-            "取消任务: `取消 <关键词>`\n"
-            "更多帮助: `帮助`",
-            response_url, webhook_key,
-        )
+        # Default: treat any unrecognized message as a research topic.
+        # The bot's primary purpose is research — no need to force a "研究" prefix.
+        topic = text.strip()
+        if topic and len(topic) >= 2:
+            reply_message(f"🔬 收到！开始研究「{topic}」...", response_url, webhook_key)
+            run_research_async(topic, webhook_key, from_user)
+        else:
+            reply_message(
+                "请发送研究主题，例如: `潜水蛙鞋设计`\n"
+                "查看任务状态: `状态`\n"
+                "更多帮助: `帮助`",
+                response_url, webhook_key,
+            )
 
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
@@ -858,22 +946,32 @@ class WeComBotHandler(BaseHTTPRequestHandler):
             if ok:
                 print(f"[bot] Decrypted: {decrypted[:500]}...")
                 msg = _extract_message(decrypted)
+
+                # Deduplication — WeCom retries callbacks
+                if _is_duplicate_msg(msg["msg_id"]):
+                    print(f"[bot] Duplicate message {msg['msg_id']}, skipping")
+                    return
+
                 # Use webhook_url from message as fallback for BOT_KEY
                 webhook_key = BOT_KEY
                 if not webhook_key and msg["webhook_url"]:
-                    # Extract key from full webhook URL
                     wh_match = re.search(r'key=([^&]+)', msg["webhook_url"])
                     if wh_match:
                         webhook_key = wh_match.group(1)
+                print(f"[bot]   Extracted: text={msg['text']!r} from={msg['from_user']} type={msg['msg_type']} msgid={msg['msg_id']}")
+                print(f"[bot]   response_url={'present' if msg['response_url'] else 'empty'} webhook_key={'present' if webhook_key else 'empty'}")
                 if msg["text"]:
                     handle_message(msg["text"], msg["from_user"], msg["response_url"], webhook_key)
                 else:
-                    print(f"[bot] No text in message (type={msg['msg_type']}, keys={msg.keys()})")
+                    print(f"[bot] No text in message (type={msg['msg_type']})")
                     if DEBUG:
                         print(f"[bot]   Full decrypted content: {decrypted[:1000]}")
                 return
             else:
                 print(f"[bot] Decryption failed, trying plaintext")
+        elif not _crypt:
+            # CRITICAL: log every dropped message when crypto is not configured
+            print(f"[bot] ⚠️ DROPPING message — encryption not configured! Set WECOM_BOT_TOKEN/AES_KEY/RECEIVE_ID")
 
         # Fallback: try plaintext JSON (for testing only)
         if DEBUG:
