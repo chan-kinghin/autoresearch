@@ -77,6 +77,8 @@ class TaskInfo:
     webhook_key: str
     start_time: float
     work_dir: Path
+    response_url: str = ""
+    notified: bool = False  # True once completion/error notification was sent
 
 
 _running_tasks: dict[str, TaskInfo] = {}
@@ -350,6 +352,82 @@ def generate_research_program(topic: str) -> str:
 """
 
 
+def _send_findings_as_messages(findings: str, response_url: str = "", webhook_key: str = "") -> None:
+    """Split findings.md content into topic sections and send each as a WeCom message."""
+    body = findings.strip()
+    # Remove auto-generated header lines
+    for prefix in ("# Research Findings", "> Auto-generated"):
+        body = "\n".join(
+            l for l in body.split("\n")
+            if not l.strip().startswith(prefix)
+        )
+    sections = [s.strip() for s in body.split("\n---\n") if s.strip()]
+    for i, section in enumerate(sections):
+        # Only the first chunk uses response_url (one-time use); rest go via webhook
+        url = response_url if i == 0 else ""
+        if len(section) > 3800:
+            # Chunk long sections at newline boundaries
+            chunk_start = 0
+            chunk_idx = 0
+            while chunk_start < len(section):
+                chunk = section[chunk_start:chunk_start + 3800]
+                if chunk_start + 3800 < len(section):
+                    last_nl = chunk.rfind("\n")
+                    if last_nl > 2000:
+                        chunk = section[chunk_start:chunk_start + last_nl]
+                        chunk_start += last_nl + 1
+                    else:
+                        chunk_start += 3800
+                else:
+                    chunk_start = len(section)
+                # Use response_url only for the very first chunk
+                chunk_url = url if chunk_idx == 0 else ""
+                reply_message(chunk, response_url=chunk_url, webhook_key=webhook_key)
+                chunk_idx += 1
+        else:
+            reply_message(section, response_url=url, webhook_key=webhook_key)
+
+
+def _read_task_progress(work_dir: Path) -> dict:
+    """Read progress data from a task's work directory. Returns structured info."""
+    info: dict = {"iteration": 0, "coverage": "N/A", "sources": "N/A", "current_step": "", "status": "running"}
+
+    # Read progress.tsv for iteration/coverage
+    progress_path = work_dir / "progress.tsv"
+    if progress_path.exists():
+        try:
+            lines = progress_path.read_text(encoding="utf-8").strip().split("\n")
+            if len(lines) > 1:
+                info["iteration"] = len(lines) - 1
+                parts = lines[-1].split("\t")
+                if len(parts) >= 2:
+                    info["coverage"] = parts[1]
+                if len(parts) >= 3:
+                    info["sources"] = parts[2]
+                if len(parts) >= 5:
+                    info["status"] = parts[4]
+        except OSError:
+            pass
+
+    # Tail stdout.log for current step
+    stdout_path = work_dir / "stdout.log"
+    if stdout_path.exists():
+        try:
+            text = stdout_path.read_text(encoding="utf-8")
+            lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+            # Find the last meaningful line (skip blank lines and progress bars)
+            for line in reversed(lines[-20:]):
+                if line and not line.startswith("[") and not line.startswith("#"):
+                    info["current_step"] = line[:120]
+                    break
+            if not info["current_step"] and lines:
+                info["current_step"] = lines[-1][:120]
+        except OSError:
+            pass
+
+    return info
+
+
 def _check_and_send_progress(
     work_dir: Path, webhook_key: str, topic: str, last_lines: int,
 ) -> int:
@@ -373,6 +451,7 @@ def _check_and_send_progress(
 
 def run_research_async(
     topic: str, webhook_key: str, from_user: str = "",
+    response_url: str = "",
 ) -> None:
     """Run research in a background thread and send results to WeCom."""
     task_key = topic if len(topic) <= 80 else topic[:40] + "..." + hashlib.md5(topic.encode()).hexdigest()[:8]
@@ -401,6 +480,7 @@ def run_research_async(
             webhook_key=webhook_key,
             start_time=time.time(),
             work_dir=work_dir,
+            response_url=response_url,
         )
         _running_tasks[task_key] = task_info
 
@@ -408,6 +488,22 @@ def run_research_async(
     work_dir.mkdir(parents=True, exist_ok=True)
     program = generate_research_program(topic)
     (work_dir / "research_program.md").write_text(program, encoding="utf-8")
+
+    def _notify(msg: str) -> bool:
+        """Send notification using all available channels. Returns True if any succeeded.
+
+        Uses the freshest response_url available — either updated by a recent
+        '状态' check or the original from the research request.
+        """
+        fresh_url = task_info.response_url  # May have been refreshed by status checks
+        print(f"[bot] _notify for '{topic}': response_url={'set' if fresh_url else 'EMPTY'}, webhook_key={'set' if webhook_key else 'EMPTY'}")
+        sent = reply_message(msg, response_url=fresh_url, webhook_key=webhook_key)
+        if sent:
+            task_info.notified = True
+            print(f"[bot] _notify succeeded for '{topic}'")
+        else:
+            print(f"[bot] !! NOTIFICATION FAILED for '{topic}': no channel delivered the message")
+        return sent
 
     def _run():
         try:
@@ -460,9 +556,10 @@ def run_research_async(
                         except subprocess.TimeoutExpired:
                             proc.kill()
                             proc.wait()
-                        return  # Cancelled
+                        task_info.notified = True  # Cancellation is intentional
+                        return
 
-                    # Poll progress (webhook only — response_url expired)
+                    # Poll progress via webhook (response_url is reserved for final result)
                     last_lines = _check_and_send_progress(work_dir, webhook_key, topic, last_lines)
 
                     # Check timeout
@@ -474,12 +571,10 @@ def run_research_async(
                         if partial_findings.exists():
                             findings = partial_findings.read_text(encoding="utf-8")
                             if findings.strip():
-                                send_wecom_markdown(webhook_key, f"**⏰ 研究超时（1小时），以下为部分结果**\n\n> {topic}\n\n---\n\n{findings}")
+                                _notify(f"**⏰ 研究超时（1小时），以下为部分结果**\n\n> {topic}\n\n---\n\n{findings}")
                                 send_wecom_file(webhook_key, partial_findings)
-                                if from_user:
-                                    send_wecom_text(webhook_key, f"@{from_user} 研究超时但已有部分结果", mentioned=[from_user])
                                 return
-                        send_wecom_text(webhook_key, f"⏰ 研究超时（1小时）: {topic}")
+                        _notify(f"⏰ 研究超时（1小时）: {topic}")
                         return
 
                     time.sleep(15)
@@ -511,13 +606,9 @@ def run_research_async(
                     f"- 最终覆盖率: {last_coverage}\n"
                     f"- 耗时: {elapsed:.0f}s\n"
                     f"- 运行ID: `{run_id}`\n\n"
-                    f"---\n\n"
+                    f"发送 `结果` 查看完整研究报告"
                 )
-                # response_url expired long ago — use webhook only
-                reply_message(summary + findings, webhook_key=webhook_key)
-                send_wecom_file(webhook_key, findings_path)
-                if progress_path.exists():
-                    send_wecom_file(webhook_key, progress_path)
+                _notify(summary)
 
                 # Mention the user who started the research
                 if from_user:
@@ -527,19 +618,41 @@ def run_research_async(
                         mentioned=[from_user],
                     )
             else:
-                # Read last 300 chars of stderr/stdout for error context
-                stderr_text = stderr_log.read_text(encoding="utf-8")[-300:] if stderr_log.exists() else ""
-                stdout_text = stdout_log.read_text(encoding="utf-8")[-300:] if stdout_log.exists() else ""
-                error_detail = stderr_text or stdout_text
-                error_lines = [l.strip() for l in error_detail.strip().split("\n") if l.strip()]
+                # Read last 20 lines of stderr/stdout for error context
+                stderr_text = stderr_log.read_text(encoding="utf-8") if stderr_log.exists() else ""
+                stdout_text = stdout_log.read_text(encoding="utf-8") if stdout_log.exists() else ""
+                # Prefer stderr for errors, fall back to stdout
+                error_source = stderr_text if stderr_text.strip() else stdout_text
+                error_lines = [l.strip() for l in error_source.strip().split("\n") if l.strip()]
+                last_20 = error_lines[-20:]
                 last_line = error_lines[-1] if error_lines else "未知错误"
+                error_excerpt = "\n".join(last_20) if last_20 else "无日志输出"
                 print(f"[bot] Research failed (rc={proc.returncode}): {last_line}")
-                send_wecom_text(webhook_key, f"❌ 研究失败: {last_line}\n\n如需详细错误信息，请联系管理员。")
+
+                # Send partial findings if available
+                findings_path = work_dir / "findings.md"
+                partial = ""
+                if findings_path.exists():
+                    content = findings_path.read_text(encoding="utf-8").strip()
+                    if content:
+                        partial = f"\n\n---\n**已完成的部分结果已保存**, 运行ID: `{run_id}`"
+
+                _notify(
+                    f"❌ **研究失败** (退出码 {proc.returncode})\n\n"
+                    f"> {topic}\n\n"
+                    f"**最后日志:**\n```\n{error_excerpt}\n```"
+                    f"{partial}",
+                )
 
         except Exception as e:
             print(f"[bot] Research error for '{topic}': {e}")
-            send_wecom_text(webhook_key, f"❌ 研究出错，请稍后重试。如持续失败请联系管理员。")
+            _notify(f"❌ 研究出错: {e}\n\n请稍后重试。如持续失败请联系管理员。")
         finally:
+            # Guaranteed final notification if nothing was sent
+            if not task_info.notified:
+                elapsed = time.time() - task_info.start_time
+                print(f"[bot] !! Task '{topic}' ending without notification after {elapsed:.0f}s — sending fallback")
+                _notify(f"⚠️ 研究任务「{topic}」已结束 ({elapsed:.0f}s)，但结果发送失败。\n\n请发送 `历史` 查看运行记录，或联系管理员。")
             with _tasks_lock:
                 _running_tasks.pop(task_key, None)
 
@@ -555,7 +668,9 @@ HELP_TEXT = """🔬 **AutoResearch Bot**
 
 使用方法:
 - `研究 <主题>` — 启动自动研究
-- `状态` — 查看当前运行状态
+- `状态` — 查看所有任务进度（迭代、覆盖率、当前步骤）
+- `状态 <关键词>` — 查看某个任务的详细进度
+- `结果 <关键词>` — 获取运行中任务的中间结果
 - `取消 <关键词>` — 取消运行中的任务
 - `历史` — 查看最近的研究记录
 - `帮助` — 显示此帮助信息
@@ -716,7 +831,9 @@ INTRO_TEXT = """**🔬 研究助手 — AutoResearch Bot**
 
 **使用方法：**
 - `研究 <主题>` — 发起研究，例如：`研究 碳纤维在消费电子中的应用趋势`
-- `状态` — 查看进行中的任务
+- `状态` — 查看所有任务进度（迭代、覆盖率、当前步骤）
+- `状态 <关键词>` — 查看某个任务的详细进度
+- `结果 <关键词>` — 获取运行中任务的中间结果
 - `取消 <关键词>` — 取消运行中的任务
 - `历史` — 查看最近的研究记录
 - `帮助` — 显示本说明"""
@@ -756,20 +873,52 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
                        "介绍", "你是谁", "hi", "hello", "你好"):
         reply_message(INTRO_TEXT, response_url, webhook_key)
 
-    elif text_lower in ("状态", "status"):
+    elif text_lower in ("状态", "status") or text_lower.startswith(("状态 ", "status ")):
+        detail_query = ""
+        if text_lower.startswith(("状态 ", "status ")):
+            detail_query = text.split(None, 1)[1].strip().lower() if len(text.split(None, 1)) > 1 else ""
+
         with _tasks_lock:
-            if _running_tasks:
-                items = []
-                for k, info in _running_tasks.items():
-                    elapsed = time.time() - info.start_time
-                    items.append(f"- {k} (by {info.from_user}, {elapsed:.0f}s)")
-                tasks_str = "\n".join(items)
-            else:
-                tasks_str = ""
-        if tasks_str:
-            reply_message(f"🔄 正在运行的任务:\n{tasks_str}", response_url, webhook_key)
-        else:
+            snapshot = {k: v for k, v in _running_tasks.items()}
+            # Refresh response_url in running tasks so _notify() can use a fresh one
+            if response_url:
+                for task in _running_tasks.values():
+                    task.response_url = response_url
+                    print(f"[bot] Refreshed response_url for task '{task.topic}'")
+
+        if not snapshot:
             reply_message("✅ 当前没有运行中的任务", response_url, webhook_key)
+        elif detail_query:
+            # Detail view for a specific task
+            matched = [(k, v) for k, v in snapshot.items() if detail_query in k.lower()]
+            if not matched:
+                reply_message(f"未找到匹配「{detail_query}」的任务", response_url, webhook_key)
+            else:
+                k, info = matched[0]
+                elapsed = time.time() - info.start_time
+                progress = _read_task_progress(info.work_dir)
+                lines = [
+                    f"**📊 任务详情: {k}**\n",
+                    f"- 发起人: {info.from_user}",
+                    f"- 耗时: {elapsed:.0f}s",
+                    f"- 迭代: 第{progress['iteration']}轮",
+                    f"- 覆盖率: {progress['coverage']}",
+                    f"- 来源数: {progress['sources']}",
+                ]
+                if progress["current_step"]:
+                    lines.append(f"- 当前: {progress['current_step']}")
+                reply_message("\n".join(lines), response_url, webhook_key)
+        else:
+            # Overview of all running tasks
+            items = []
+            for k, info in snapshot.items():
+                elapsed = time.time() - info.start_time
+                progress = _read_task_progress(info.work_dir)
+                line = f"- **{k}** — 第{progress['iteration']}轮, 覆盖率 {progress['coverage']}, {elapsed:.0f}s"
+                if progress["current_step"]:
+                    line += f"\n  > {progress['current_step']}"
+                items.append(line)
+            reply_message(f"🔄 正在运行的任务:\n\n" + "\n".join(items), response_url, webhook_key)
 
     elif "取消" in text_lower or text_lower.startswith("cancel"):
         # Cancel a running task by substring match
@@ -803,7 +952,68 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
                     tasks = "\n".join(f"- {k}" for k in task_keys)
                     reply_message(f"未找到匹配「{cancel_query}」的任务。当前运行中:\n{tasks}", response_url, webhook_key)
 
-    elif text_lower in ("历史", "history", "结果", "列表"):
+    elif text_lower.startswith("结果"):
+        # On-demand results: bare "结果" = most recent, "结果 <keyword>" = search
+        result_query = text.split(None, 1)[1].strip().lower() if len(text.split(None, 1)) > 1 else ""
+
+        # 1) Check running tasks first
+        with _tasks_lock:
+            snapshot = {k: v for k, v in _running_tasks.items()}
+        matched_running = [(k, v) for k, v in snapshot.items() if result_query in k.lower()] if result_query else list(snapshot.items())
+
+        if matched_running:
+            k, info = matched_running[0]
+            findings_path = info.work_dir / "findings.md"
+            if findings_path.exists():
+                findings = findings_path.read_text(encoding="utf-8")
+                if findings.strip():
+                    progress = _read_task_progress(info.work_dir)
+                    header = (
+                        f"📝 **「{k}」中间结果**\n"
+                        f"第{progress['iteration']}轮 | 覆盖率 {progress['coverage']} | 来源 {progress['sources']}"
+                    )
+                    reply_message(header, response_url, webhook_key)
+                    _send_findings_as_messages(findings, response_url="", webhook_key=webhook_key)
+                else:
+                    reply_message(f"「{k}」尚未产生研究结果，请稍后再试", response_url, webhook_key)
+            else:
+                reply_message(f"「{k}」尚未产生研究结果（可能还在第一轮搜索中）", response_url, webhook_key)
+
+        else:
+            # 2) Search completed runs in RUNS_DIR
+            found_findings = None
+            found_topic = ""
+            found_run_id = ""
+            if RUNS_DIR.exists():
+                runs = sorted(RUNS_DIR.iterdir(), reverse=True)
+                for r in runs:
+                    if not r.is_dir():
+                        continue
+                    fp = r / "findings.md"
+                    if not fp.exists():
+                        continue
+                    # Get topic from research_program.md
+                    prog = r / "research_program.md"
+                    topic_name = r.name
+                    if prog.exists():
+                        first_line = prog.read_text(encoding="utf-8").split("\n")[0]
+                        topic_name = first_line.replace("# Research Program: ", "")
+                    # If query given, filter by keyword; otherwise take the most recent
+                    if result_query and result_query not in topic_name.lower() and result_query not in r.name.lower():
+                        continue
+                    found_findings = fp.read_text(encoding="utf-8")
+                    found_topic = topic_name
+                    found_run_id = r.name
+                    break
+
+            if found_findings and found_findings.strip():
+                header = f"📋 **研究报告：{found_topic}**\n运行ID: `{found_run_id}`"
+                reply_message(header, response_url, webhook_key)
+                _send_findings_as_messages(found_findings, response_url="", webhook_key=webhook_key)
+            else:
+                reply_message("未找到研究结果。发送 `历史` 查看已完成的研究列表。", response_url, webhook_key)
+
+    elif text_lower in ("历史", "history", "列表"):
         runs = sorted(RUNS_DIR.iterdir(), reverse=True)[:10] if RUNS_DIR.exists() else []
         if runs:
             items = []
@@ -832,8 +1042,10 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
         else:
             topic = ""
         if topic:
-            reply_message(f"🔬 收到！开始研究「{topic}」...", response_url, webhook_key)
-            run_research_async(topic, webhook_key, from_user)
+            # Reserve response_url for async research result (it can only be used ONCE).
+            # Send immediate ack via webhook only; if no webhook, skip ack.
+            reply_message(f"🔬 收到！开始研究「{topic}」...", webhook_key=webhook_key)
+            run_research_async(topic, webhook_key, from_user, response_url=response_url)
         else:
             reply_message("请提供研究主题，例如: `研究 潜水蛙鞋设计`", response_url, webhook_key)
 
@@ -842,8 +1054,9 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
         # The bot's primary purpose is research — no need to force a "研究" prefix.
         topic = text.strip()
         if topic and len(topic) >= 2:
-            reply_message(f"🔬 收到！开始研究「{topic}」...", response_url, webhook_key)
-            run_research_async(topic, webhook_key, from_user)
+            # Reserve response_url for async research result (one-time use)
+            reply_message(f"🔬 收到！开始研究「{topic}」...", webhook_key=webhook_key)
+            run_research_async(topic, webhook_key, from_user, response_url=response_url)
         else:
             reply_message(
                 "请发送研究主题，例如: `潜水蛙鞋设计`\n"
@@ -866,7 +1079,36 @@ class WeComBotHandler(BaseHTTPRequestHandler):
         return match.group(1) if match else ""
 
     def do_GET(self):
-        """Handle callback URL verification (encrypted echostr)."""
+        """Handle callback URL verification and /status endpoint."""
+        parsed = urlparse(self.path)
+
+        # /status — JSON API for monitoring
+        if parsed.path == "/status":
+            with _tasks_lock:
+                snapshot = {k: v for k, v in _running_tasks.items()}
+            tasks = []
+            for k, info in snapshot.items():
+                elapsed = time.time() - info.start_time
+                progress = _read_task_progress(info.work_dir)
+                alive = info.proc.poll() is None if info.proc else False
+                tasks.append({
+                    "topic": k,
+                    "from_user": info.from_user,
+                    "elapsed_s": round(elapsed),
+                    "iteration": progress["iteration"],
+                    "coverage": progress["coverage"],
+                    "sources": progress["sources"],
+                    "current_step": progress["current_step"],
+                    "process_alive": alive,
+                    "run_id": info.work_dir.name,
+                })
+            body = json.dumps({"running_tasks": tasks, "count": len(tasks)}, ensure_ascii=False, indent=2)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+            return
+
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         raw_query = parsed.query
@@ -1002,7 +1244,11 @@ def main():
         print("   Bot will still run but URL verification will fail.")
 
     if not BOT_KEY:
-        print("⚠️  WECOM_BOT_KEY not set. Bot can receive but won't be able to send replies.")
+        print("⚠️⚠️⚠️  WECOM_BOT_KEY not set!")
+        print("   The bot CANNOT send async research results without a webhook key.")
+        print("   Immediate replies via response_url will work, but research completion")
+        print("   notifications will be SILENTLY LOST.")
+        print("   Set WECOM_BOT_KEY in your environment to fix this.")
 
     server = ThreadingHTTPServer((args.host, args.port), WeComBotHandler)
     print(f"🤖 WeCom bot listening on http://{args.host}:{args.port}")
