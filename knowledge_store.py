@@ -319,6 +319,24 @@ class KnowledgeStore:
                 max_id = max(max_id, int(match.group(1)))
         return max_id + 1
 
+    def get_seen_urls(self) -> set[str]:
+        """Return all URLs already stored across all source records.
+
+        Scans details/sources/src_*.json and collects the 'url' field from each.
+        Useful for cross-iteration deduplication — callers can skip URLs already fetched.
+        """
+        seen: set[str] = set()
+        sources_dir = self.root / "details" / "sources"
+        for path in sources_dir.glob("src_*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                url = data.get("url")
+                if url:
+                    seen.add(url)
+            except (json.JSONDecodeError, OSError):
+                continue
+        return seen
+
     # ── Raw results ───────────────────────────────────────────────────────
 
     def save_raw_results(self, iteration: int, results: list) -> None:
@@ -479,19 +497,28 @@ Rules:
             return []
 
         query_keywords = self._extract_keywords(gap_queries)
-        if not query_keywords:
-            return []
 
         # Score each topic
         scored: list[tuple[float, str]] = []
-        for topic in index.topics:
-            topic_keywords = set(kw.lower() for kw in topic.keywords)
-            keyword_overlap = len(query_keywords & topic_keywords)
-            score = keyword_overlap * (1.0 - topic.coverage)
-            if topic.stale:
-                score += 0.5
-            if score > 0:
-                scored.append((score, topic.id))
+        if query_keywords:
+            # Normal path: rank by keyword overlap weighted by gap size
+            for topic in index.topics:
+                topic_keywords = set(kw.lower() for kw in topic.keywords)
+                keyword_overlap = len(query_keywords & topic_keywords)
+                score = keyword_overlap * (1.0 - topic.coverage)
+                if topic.stale:
+                    score += 0.5
+                if score > 0:
+                    scored.append((score, topic.id))
+        else:
+            # Fallback for auto mode: no queries → return lowest-coverage topics
+            # so gap analysis LLM always sees actual content, not just the index
+            for topic in index.topics:
+                score = (1.0 - topic.coverage)
+                if topic.stale:
+                    score += 0.5
+                if score > 0:
+                    scored.append((score, topic.id))
 
         # Sort by score descending
         scored.sort(key=lambda x: x[0], reverse=True)
