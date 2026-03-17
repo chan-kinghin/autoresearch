@@ -10,6 +10,7 @@ knowledge_store.py — Progressive disclosure knowledge store.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -353,27 +354,359 @@ class KnowledgeStore:
         """Build findings.md by concatenating all topic summaries.
 
         Writes the result to store_dir/findings.md and returns the content.
+        Includes confidence levels (D2), question matrix (D3), source recency (D4),
+        contradiction log (D6), and citation validation (D7).
         """
         index = self.load_index()
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-        sections: list[str] = []
+        parts: list[str] = []
+
+        # Header
+        parts.append(f"# Research Findings\n> Auto-generated from knowledge store | {now}\n")
+
+        # D2: Topic sections with confidence levels
+        topic_sections: list[str] = []
         for topic in index.topics:
             summary = self.read_summary(topic.id)
             if summary.strip():
-                sections.append(summary.strip())
+                coverage_pct = int(topic.coverage * 100)
+                # D2: Confidence level based on sources and coverage
+                if topic.source_count >= 5 and topic.coverage >= 0.7:
+                    confidence = "HIGH"
+                elif topic.source_count >= 2 and topic.coverage >= 0.4:
+                    confidence = "MEDIUM"
+                else:
+                    confidence = "LOW"
+                section = (
+                    f"## {topic.title}\n\n"
+                    f"Coverage: {coverage_pct}% | Confidence: {confidence} | Sources: {topic.source_count}\n\n"
+                    f"{summary.strip()}"
+                )
+                topic_sections.append(section)
 
-        body = "\n\n---\n\n".join(sections) if sections else "(No findings yet.)"
+        if topic_sections:
+            parts.append("\n\n---\n\n".join(topic_sections))
+        else:
+            parts.append("(No findings yet.)")
 
-        content = (
-            f"# Research Findings\n"
-            f"> Auto-generated from knowledge store | {now}\n\n"
-            f"{body}\n"
-        )
+        # D3: Question resolution matrix
+        question_matrix = self.generate_question_matrix()
+        if question_matrix:
+            parts.append(f"\n---\n\n{question_matrix}")
+
+        # Open questions (existing)
+        open_qs = [q for q in index.questions if q.status in ("unanswered", "partial")]
+        if open_qs:
+            parts.append("\n---\n\n## Open Questions\n")
+            for q in open_qs:
+                parts.append(f"- [{q.status}] {q.text}")
+            parts.append("")
+
+        # D6: Contradiction log
+        contradictions = self.get_contradictions_from_summaries()
+        if contradictions:
+            parts.append("\n---\n\n## Known Conflicts & Uncertainties\n")
+            for c in contradictions:
+                parts.append(f"- {c}")
+            parts.append("")
+
+        # D4: Source recency analysis
+        recency = self.analyze_source_recency()
+        if recency:
+            parts.append(f"\n{recency}")
+
+        # Sources summary (existing)
+        if index.meta.total_sources > 0:
+            parts.append(f"\n---\n\n## Sources\n\nTotal sources: {index.meta.total_sources}\n")
+
+        # D7: Citation validation
+        validation = self.validate_citations()
+        if validation["total_citations"] > 0:
+            parts.append(f"Citation validation: {validation['matched']}/{validation['total_citations']} "
+                         f"citations matched to sources ({validation['match_rate']:.0%})")
+            if validation["unmatched"]:
+                parts.append(f"Unmatched citations: {', '.join(validation['unmatched'][:5])}")
+            parts.append("")
+
+        # Metadata footer
+        parts.append(f"\n---\n\n_Coverage: {index.meta.avg_coverage:.0%} | "
+                      f"Iterations: {index.meta.iterations} | "
+                      f"Generated: {now}_\n")
+
+        content = "\n".join(parts)
 
         findings_path = self.root / "findings.md"
         findings_path.write_text(content, encoding="utf-8")
         return content
+
+    # ── D1: Citation Index Builder ─────────────────────────────────────────
+
+    def build_citation_index(self) -> Dict[str, Dict[str, Any]]:
+        """Build a mapping from inline citations to source records.
+
+        Scans all topic summaries for citation patterns like [Author, Year] or [Source Name]
+        and maps them to source records in the store.
+
+        Returns: {citation_text: {source_id, url, title, year, source_type}}
+        """
+        index = self.load_index()
+        citation_map: Dict[str, Dict[str, Any]] = {}
+
+        # Load all sources
+        sources_dir = self.root / "details" / "sources"
+        all_sources: list[dict] = []
+        for path in sorted(sources_dir.glob("src_*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                data["_source_id"] = path.stem
+                all_sources.append(data)
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        # Scan summaries for citations
+        for topic in index.topics:
+            summary = self.read_summary(topic.id)
+            # Match [Author, Year], [Author et al., Year], [Source Name]
+            citations = re.findall(r'\[([^\]]+)\]', summary)
+            for cite in citations:
+                if cite in citation_map:
+                    continue
+                # Try to match against sources
+                cite_lower = cite.lower()
+                for src in all_sources:
+                    title = src.get("title", "").lower()
+                    authors = src.get("authors", "").lower()
+                    year = str(src.get("year", ""))
+                    if (year and year in cite and (
+                        any(name.strip().split()[-1].lower() in cite_lower
+                            for name in authors.split(",") if name.strip())
+                        or title[:20].lower() in cite_lower
+                    )):
+                        citation_map[cite] = {
+                            "source_id": src["_source_id"],
+                            "url": src.get("url", ""),
+                            "title": src.get("title", ""),
+                            "year": year,
+                            "source_type": src.get("source", "unknown"),
+                        }
+                        break
+
+        return citation_map
+
+    # ── D3: Question Resolution Matrix ─────────────────────────────────────
+
+    def generate_question_matrix(self) -> str:
+        """Generate a question resolution matrix showing coverage status per research question."""
+        index = self.load_index()
+        if not index.questions:
+            return ""
+
+        lines: list[str] = []
+        lines.append("## Research Questions: Coverage Status\n")
+        lines.append("| # | Question | Status | Related Topics | Gap |")
+        lines.append("|---|----------|--------|----------------|-----|")
+
+        for i, q in enumerate(index.questions, 1):
+            status_icon = {"answered": "\u2705", "partial": "\U0001f536", "unanswered": "\u274c"}.get(q.status, "\u2753")
+            topics_str = ", ".join(q.related_topics) if q.related_topics else "\u2014"
+            gap = "None" if q.status == "answered" else "Needs more research"
+            lines.append(f"| {i} | {q.text} | {status_icon} {q.status.title()} | {topics_str} | {gap} |")
+
+        lines.append("")
+
+        # Summary counts
+        answered = sum(1 for q in index.questions if q.status == "answered")
+        partial = sum(1 for q in index.questions if q.status == "partial")
+        unanswered = sum(1 for q in index.questions if q.status == "unanswered")
+        total = len(index.questions)
+        lines.append(f"**Summary**: {answered}/{total} answered, {partial}/{total} partial, {unanswered}/{total} open\n")
+
+        return "\n".join(lines)
+
+    # ── D4: Temporal Awareness ─────────────────────────────────────────────
+
+    def analyze_source_recency(self) -> str:
+        """Analyze the age distribution of sources and return a summary."""
+        sources_dir = self.root / "details" / "sources"
+        years: list[int] = []
+        current_year = datetime.now().year
+
+        for path in sources_dir.glob("src_*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                year_str = str(data.get("year", ""))
+                if year_str and year_str.isdigit():
+                    years.append(int(year_str))
+            except (json.JSONDecodeError, OSError, ValueError):
+                continue
+
+        if not years:
+            return ""
+
+        years.sort()
+        newest = max(years)
+        oldest = min(years)
+        median_idx = len(years) // 2
+        median = years[median_idx]
+        old_count = sum(1 for y in years if current_year - y > 3)
+        old_pct = int(old_count / len(years) * 100)
+
+        lines: list[str] = []
+        lines.append("## Source Recency Analysis\n")
+        lines.append(f"- **Newest source**: {newest}")
+        lines.append(f"- **Oldest source**: {oldest}")
+        lines.append(f"- **Median source year**: {median}")
+        lines.append(f"- **Total sources with year data**: {len(years)}")
+        if old_pct > 30:
+            lines.append(f"- \u26a0\ufe0f {old_pct}% of sources are >3 years old. Consider searching for recent developments.")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    # ── D5: Multi-format Export ────────────────────────────────────────────
+
+    def export_executive_summary(self) -> str:
+        """Generate a 1-page executive summary of research findings."""
+        index = self.load_index()
+        model = os.environ.get("AUTORESEARCH_MODEL", "claude-sonnet-4-20250514")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        answered = sum(1 for q in index.questions if q.status == "answered")
+        partial = sum(1 for q in index.questions if q.status == "partial")
+        total_q = len(index.questions) or 1
+
+        lines: list[str] = []
+        lines.append("# Executive Summary\n")
+        lines.append(f"_Generated: {now} | Model: {model}_\n")
+        lines.append(f"## Coverage")
+        lines.append(f"- Overall: {index.meta.avg_coverage:.0%}")
+        lines.append(f"- Questions: {answered}/{total_q} answered, {partial}/{total_q} partial")
+        lines.append(f"- Sources consulted: {index.meta.total_sources}")
+        lines.append(f"- Iterations: {index.meta.iterations}\n")
+
+        # Top findings per topic
+        lines.append("## Key Findings\n")
+        for topic in sorted(index.topics, key=lambda t: t.coverage, reverse=True)[:5]:
+            summary = self.read_summary(topic.id)
+            # Extract first meaningful sentence
+            first_line = ""
+            for line in summary.split("\n"):
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#") and len(stripped) > 20:
+                    first_line = stripped[:200]
+                    break
+            if first_line:
+                confidence = "HIGH" if topic.source_count >= 5 and topic.coverage >= 0.7 else \
+                             "MEDIUM" if topic.source_count >= 2 else "LOW"
+                lines.append(f"- **{topic.title}** [{confidence}]: {first_line}")
+
+        # Open gaps
+        open_q = [q for q in index.questions if q.status in ("unanswered", "partial")]
+        if open_q:
+            lines.append(f"\n## Remaining Gaps\n")
+            for q in open_q[:5]:
+                lines.append(f"- {q.text}")
+
+        lines.append("")
+        return "\n".join(lines)
+
+    def export_bibtex(self) -> str:
+        """Export source citations in BibTeX format."""
+        sources_dir = self.root / "details" / "sources"
+        entries: list[str] = []
+
+        for path in sorted(sources_dir.glob("src_*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            title = data.get("title", "")
+            authors = data.get("authors", "")
+            year = str(data.get("year", ""))
+            url = data.get("url", "")
+            source = data.get("source", "misc")
+
+            if not title:
+                continue
+
+            # Generate a cite key
+            first_author = authors.split(",")[0].strip().split()[-1] if authors else "unknown"
+            cite_key = f"{first_author.lower()}{year}" if year else first_author.lower()
+            cite_key = re.sub(r'[^a-z0-9]', '', cite_key)
+
+            entry_type = "article" if source in ("semantic_scholar", "arxiv") else "misc"
+            entry = f"@{entry_type}{{{cite_key},\n"
+            entry += f"  title = {{{title}}},\n"
+            if authors:
+                entry += f"  author = {{{authors}}},\n"
+            if year:
+                entry += f"  year = {{{year}}},\n"
+            if url:
+                entry += f"  url = {{{url}}},\n"
+            entry += f"  note = {{Retrieved via {source}}}\n"
+            entry += "}"
+            entries.append(entry)
+
+        return "\n\n".join(entries)
+
+    # ── D6: Contradiction Log ──────────────────────────────────────────────
+
+    def get_contradictions_from_summaries(self) -> list[str]:
+        """Scan summaries for contradiction markers added by synthesis."""
+        index = self.load_index()
+        contradictions: list[str] = []
+
+        for topic in index.topics:
+            summary = self.read_summary(topic.id)
+            # Look for contradiction markers from synthesis
+            for line in summary.split("\n"):
+                stripped = line.strip()
+                if any(marker in stripped.lower() for marker in [
+                    "[conflict]", "contradict", "disagree", "competing claim",
+                    "however, source", "in contrast,",
+                ]):
+                    contradictions.append(f"**{topic.title}**: {stripped[:200]}")
+
+        return contradictions
+
+    # ── D7: Citation Validation ────────────────────────────────────────────
+
+    def validate_citations(self) -> Dict[str, Any]:
+        """Validate that inline citations in summaries map to actual sources.
+
+        Returns: {
+            "total_citations": int,
+            "matched": int,
+            "unmatched": list[str],
+            "match_rate": float,
+        }
+        """
+        citation_index = self.build_citation_index()
+        index = self.load_index()
+
+        all_citations: set[str] = set()
+        for topic in index.topics:
+            summary = self.read_summary(topic.id)
+            citations = re.findall(r'\[([^\]]+)\]', summary)
+            # Filter out markdown links and status markers
+            for cite in citations:
+                if cite.startswith("http") or cite in ("CONFLICT", "STALE") or cite.startswith("!"):
+                    continue
+                if any(c.isalpha() for c in cite):
+                    all_citations.add(cite)
+
+        matched = [c for c in all_citations if c in citation_index]
+        unmatched = [c for c in all_citations if c not in citation_index]
+
+        total = len(all_citations)
+        return {
+            "total_citations": total,
+            "matched": len(matched),
+            "unmatched": unmatched,
+            "match_rate": len(matched) / total if total > 0 else 1.0,
+        }
 
     # ── Bootstrap ─────────────────────────────────────────────────────────
 
