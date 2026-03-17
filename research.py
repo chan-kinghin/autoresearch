@@ -20,6 +20,7 @@ from search import (
     IterationLog,
     SearchResult,
     execute_searches,
+    extract_webpage,
     init_progress_log,
     llm_call,
     llm_json,
@@ -98,7 +99,12 @@ def write_file(path: str, content: str) -> None:
     Path(path).write_text(content, encoding="utf-8")
 
 
-def identify_gaps(research_program: str, store: KnowledgeStore, human_guidance: str = "") -> dict:
+def identify_gaps(
+    research_program: str,
+    store: KnowledgeStore,
+    human_guidance: str = "",
+    evaluator_suggestions: list[str] | None = None,
+) -> dict:
     """Ask LLM to identify what questions remain unanswered.
 
     Uses the knowledge store index context and low-coverage summaries
@@ -111,6 +117,14 @@ def identify_gaps(research_program: str, store: KnowledgeStore, human_guidance: 
 The researcher has provided the following direction for this iteration:
 {human_guidance}
 Prioritize this guidance when identifying gaps and planning searches.
+"""
+    if evaluator_suggestions:
+        suggestions_text = "\n".join(f"- {s}" for s in evaluator_suggestions)
+        guidance_block += f"""
+## Evaluator Suggestions
+The evaluator suggested focusing on:
+{suggestions_text}
+Consider these when planning searches.
 """
 
     # Use budget-aware context building with relevance routing
@@ -191,9 +205,16 @@ def extract_topic_findings(
         if r.year:
             entry += f"- **Year**: {r.year}\n"
         entry += f"- **Source type**: {r.source}\n"
-        content = r.full_text if r.full_text else r.snippet
+        # Tiered content budget: Tier 1 sources with full_text get 6000 chars,
+        # Tier 2/3 snippet-only sources get 2000 chars
+        if r.full_text:
+            content = r.full_text[:6000]
+        elif r.snippet:
+            content = r.snippet[:2000]
+        else:
+            content = ""
         if content:
-            entry += f"- **Content**: {content[:2000]}\n"
+            entry += f"- **Content**: {content}\n"
         formatted.append(entry)
 
     sources_text = "\n".join(formatted)
@@ -337,6 +358,7 @@ def run_research_loop(
     start_time = time.time()
     iteration = 0
     human_guidance = ""  # Carries guidance from one checkpoint to the next iteration
+    evaluator_suggestions: list[str] = []  # Carries evaluator suggestions to next identify_gaps()
 
     while iteration < max_iterations:
         iteration += 1
@@ -362,8 +384,9 @@ def run_research_loop(
         # Step 2: Identify gaps (now uses store)
         print("  Analyzing gaps and planning searches...")
         try:
-            gap_analysis = identify_gaps(research_program, store, human_guidance)
+            gap_analysis = identify_gaps(research_program, store, human_guidance, evaluator_suggestions)
             human_guidance = ""  # Consumed
+            evaluator_suggestions = []  # Consumed
         except Exception as e:
             print(f"  Error in gap analysis: {e}")
             log_iteration(IterationLog(iteration, 0.0, 0, time.time() - iter_start, "error"), PROGRESS_PATH)
@@ -457,6 +480,21 @@ def run_research_loop(
                 results.append(r)
                 result_topic_map.append("")  # No specific topic for fallback
             print(f"  Fallback results: {len(results)}")
+
+        # Enrich top web results (no full_text) with extract_webpage()
+        enriched = 0
+        for r in results:
+            if enriched >= 5:
+                break
+            if r.url and not r.full_text and r.source in ("duckduckgo",):
+                try:
+                    print(f"  Extracting page: {r.url[:60]}...")
+                    text = extract_webpage(r.url)
+                    if text:
+                        r.full_text = text
+                        enriched += 1
+                except Exception as e:
+                    print(f"  [extract] Failed for {r.url[:60]}: {e}")
 
         if not results:
             print("  Still no results. Skipping synthesis.")
@@ -553,6 +591,9 @@ def run_research_loop(
         except Exception as e:
             print(f"  Error in evaluation: {e}")
             evaluation = EvaluationResult(coverage_score=0.0)
+
+        # Store evaluator suggestions for next iteration's identify_gaps()
+        evaluator_suggestions = evaluation.suggested_queries or []
 
         # Update index meta
         idx = store.load_index()
