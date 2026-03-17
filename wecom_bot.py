@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -137,7 +138,7 @@ class WXBizMsgCrypt:
     def _pkcs7_unpad(self, data: bytes) -> bytes:
         pad_len = data[-1]
         if pad_len < 1 or pad_len > 32:
-            return data
+            raise ValueError(f"Invalid PKCS#7 padding length: {pad_len}")
         return data[:-pad_len]
 
     def _encrypt(self, plaintext: str) -> str:
@@ -155,13 +156,17 @@ class WXBizMsgCrypt:
         decryptor = cipher.decryptor()
         plain = decryptor.update(base64.b64decode(ciphertext)) + decryptor.finalize()
         plain = self._pkcs7_unpad(plain)
+        if len(plain) < 20:
+            raise ValueError(f"Decrypted data too short: {len(plain)} bytes, need at least 20")
         msg_len = struct.unpack("!I", plain[16:20])[0]
+        if msg_len > len(plain) - 20:
+            raise ValueError(f"Message length {msg_len} exceeds available data ({len(plain) - 20} bytes)")
         return plain[20:20 + msg_len].decode("utf-8")
 
     def verify_url(self, msg_signature: str, timestamp: str, nonce: str, echostr: str) -> tuple[bool, str]:
         """Verify callback URL — decrypt echostr and return plaintext."""
         expected = self._signature(self.token, timestamp, nonce, echostr)
-        if expected != msg_signature:
+        if not hmac.compare_digest(expected, msg_signature):
             print(f"[crypto] Signature mismatch: expected={expected}, got={msg_signature}")
             return False, ""
         try:
@@ -194,7 +199,7 @@ class WXBizMsgCrypt:
             return False, ""
 
         expected = self._signature(self.token, timestamp, nonce, encrypt)
-        if expected != msg_signature:
+        if not hmac.compare_digest(expected, msg_signature):
             print(f"[crypto] Message signature mismatch")
             return False, ""
 
