@@ -107,6 +107,171 @@ class IterationLog:
     status: str  # "continue", "target_reached", "max_iterations", "error"
 
 
+# ── A1: Query Success Tracking ────────────────────────────────────────────
+
+
+@dataclass
+class QueryRecord:
+    query: str
+    sources: List[str]
+    results_count: int
+    useful_results: int = 0
+    iteration: int = 0
+
+_query_history: List[QueryRecord] = []
+
+def record_query(query: str, sources: List[str], results_count: int, iteration: int = 0) -> None:
+    """Record a query execution for learning."""
+    _query_history.append(QueryRecord(query=query, sources=sources, results_count=results_count, iteration=iteration))
+
+def get_query_history() -> List[QueryRecord]:
+    """Return the full query history."""
+    return list(_query_history)
+
+def get_effective_queries(min_results: int = 3) -> List[str]:
+    """Return queries that yielded good results, for prompt injection."""
+    return [q.query for q in _query_history if q.results_count >= min_results]
+
+def get_failed_queries() -> List[str]:
+    """Return queries that yielded no results."""
+    return [q.query for q in _query_history if q.results_count == 0]
+
+
+# ── A2: Query Specificity Scoring ─────────────────────────────────────────
+
+
+def score_query_specificity(query: str, research_keywords: set[str] | None = None) -> float:
+    """Score query specificity 0.0-1.0. Higher = more specific.
+
+    Checks: length, domain terms, absence of vague words.
+    """
+    words = query.lower().split()
+    if len(words) < 2:
+        return 0.1
+
+    vague_words = {"things", "stuff", "general", "various", "overview", "information", "about"}
+    vague_count = sum(1 for w in words if w in vague_words)
+
+    # Base score from word count (longer queries tend to be more specific)
+    length_score = min(1.0, len(words) / 8)
+
+    # Penalty for vague words
+    vague_penalty = vague_count * 0.15
+
+    # Bonus for domain keywords
+    domain_bonus = 0.0
+    if research_keywords:
+        overlap = sum(1 for w in words if w in research_keywords)
+        domain_bonus = min(0.3, overlap * 0.1)
+
+    return max(0.0, min(1.0, length_score - vague_penalty + domain_bonus))
+
+
+# ── A3: Source Exhaustion Detection ───────────────────────────────────────
+
+
+@dataclass
+class SourceStats:
+    calls: int = 0
+    unique_urls: int = 0
+    total_results: int = 0
+
+_source_stats: Dict[str, SourceStats] = {}
+
+def get_source_stats() -> Dict[str, SourceStats]:
+    """Return per-source call statistics."""
+    return dict(_source_stats)
+
+def is_source_exhausted(source: str, threshold_calls: int = 5, min_yield: float = 1.0) -> bool:
+    """Check if a source is returning diminishing results."""
+    stats = _source_stats.get(source)
+    if not stats or stats.calls < threshold_calls:
+        return False
+    avg_yield = stats.unique_urls / stats.calls if stats.calls > 0 else 0
+    return avg_yield < min_yield
+
+def reset_source_stats() -> None:
+    """Reset source stats (call at start of each research run)."""
+    _source_stats.clear()
+
+
+# ── A5: Pre-Synthesis Result Filtering ────────────────────────────────────
+
+
+def filter_results_by_relevance(
+    results: List[SearchResult],
+    research_keywords: set[str],
+    min_relevance: float = 0.2,
+) -> List[SearchResult]:
+    """Filter out results with very low relevance to the research topic.
+
+    Uses keyword overlap between result content and research keywords.
+    Keeps at least 70% of results to avoid over-filtering.
+    """
+    if not research_keywords or len(results) <= 2:
+        return results
+
+    scored: List[Tuple[float, SearchResult]] = []
+    for r in results:
+        text = f"{r.title} {r.snippet}".lower()
+        text_words = set(re.split(r'[^a-zA-Z0-9]+', text))
+        overlap = len(text_words & research_keywords)
+        relevance = overlap / max(len(research_keywords), 1)
+        scored.append((relevance, r))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Keep at least 70% of results
+    min_keep = max(2, int(len(results) * 0.7))
+    filtered = []
+    for relevance, r in scored:
+        if len(filtered) >= min_keep and relevance < min_relevance:
+            break
+        filtered.append(r)
+
+    if len(filtered) < len(results):
+        print(f"  [filter] Removed {len(results) - len(filtered)} low-relevance results")
+
+    return filtered
+
+
+# ── A7: Query-Source Semantic Validation ──────────────────────────────────
+
+
+_STATISTICAL_KEYWORDS = {"mean", "median", "variance", "correlation", "distribution",
+                          "statistic", "sample", "hypothesis", "regression", "p-value"}
+_RECENT_KEYWORDS = {"recent", "2024", "2025", "2026", "latest", "new", "emerging", "breakthrough"}
+_ACADEMIC_KEYWORDS = {"paper", "study", "research", "journal", "survey", "review",
+                       "benchmark", "algorithm", "theorem", "proof"}
+
+def validate_query_sources(query: str, sources: List[str]) -> List[str]:
+    """Validate and adjust query-source pairings based on query content."""
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
+    adjusted = list(sources)
+
+    # Statistical query without academic sources?
+    if query_words & _STATISTICAL_KEYWORDS:
+        for academic in ("semantic_scholar", "arxiv"):
+            if academic not in adjusted:
+                adjusted.insert(0, academic)
+                break
+
+    # Academic query without academic sources?
+    if query_words & _ACADEMIC_KEYWORDS:
+        for academic in ("semantic_scholar", "arxiv"):
+            if academic not in adjusted:
+                adjusted.append(academic)
+                break
+
+    # Recent events query should include web search
+    if query_words & _RECENT_KEYWORDS:
+        if "duckduckgo" not in adjusted:
+            adjusted.append("duckduckgo")
+
+    return adjusted
+
+
 # ── LLM Calls ─────────────────────────────────────────────────────────────
 
 
@@ -590,6 +755,7 @@ def execute_searches(
     """
     all_results: List[SearchResult] = []
     seen_urls: Set[str] = set()
+    domain_counts: Dict[str, int] = {}  # A4: Track domain distribution
 
     dispatch = {
         "metaso": search_metaso,
@@ -604,6 +770,11 @@ def execute_searches(
         query = plan["query"]
         sources = plan.get("sources", ["duckduckgo"])
         for src in sources:
+            # A3: Check source exhaustion
+            if is_source_exhausted(src):
+                print(f"  [search] Skipping exhausted source: {src}")
+                continue
+
             fn = dispatch.get(src)
             if not fn:
                 print(f"  [search] Unknown source: {src}")
@@ -611,12 +782,42 @@ def execute_searches(
             adapted_query = reformulate_query(query, src)
             print(f"  Searching {src}: {adapted_query[:60]}...")
             results = fn(adapted_query)
+
+            # A3: Update source stats
+            if src not in _source_stats:
+                _source_stats[src] = SourceStats()
+            _source_stats[src].calls += 1
+            _source_stats[src].total_results += len(results)
+
+            new_count = 0
             for r in results:
                 if r.url and r.url in seen_urls:
                     continue
                 if r.url:
                     seen_urls.add(r.url)
+                    # A4: Track domain
+                    try:
+                        domain = r.url.split("/")[2] if r.url.startswith("http") else src
+                    except IndexError:
+                        domain = src
+                    domain_counts[domain] = domain_counts.get(domain, 0) + 1
                 all_results.append(r)
+                new_count += 1
+
+            _source_stats[src].unique_urls += new_count
+
+        # A1: Record query results
+        record_query(query, sources, sum(1 for r in all_results if any(
+            r.url and r.url not in seen_urls for _ in [None]  # just count new
+        )), iteration=0)
+
+    # A4: Warn about domain concentration
+    if domain_counts:
+        total = sum(domain_counts.values())
+        for domain, count in sorted(domain_counts.items(), key=lambda x: x[1], reverse=True):
+            if count / total > 0.5 and total >= 4:
+                print(f"  [diversity] Warning: {domain} dominates results ({count}/{total} = {count/total:.0%})")
+                break
 
     return all_results
 
