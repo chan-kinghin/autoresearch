@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -483,6 +484,183 @@ def _filter_meta_commentary(text: str) -> str:
     return result if result else text  # never return empty
 
 
+# ── Loop Quality: Stopping, Synthesis, Search History, Quality Gates ───────
+
+
+@dataclass
+class StoppingSignal:
+    should_stop: bool
+    reason: str
+    confidence: float  # 0.0-1.0
+
+def should_stop_research(
+    recent_scores: list[float],
+    iteration: int,
+    target_coverage: float,
+    max_iterations: int,
+) -> StoppingSignal:
+    """Multi-signal stopping heuristic beyond simple threshold."""
+    if iteration >= max_iterations:
+        return StoppingSignal(True, "max_iterations_reached", 1.0)
+
+    if len(recent_scores) < 3:
+        return StoppingSignal(False, "too_few_iterations", 0.0)
+
+    # Signal 1: Target coverage with stability (last 3 scores all above target)
+    last_3 = recent_scores[-3:]
+    if all(s >= target_coverage for s in last_3):
+        return StoppingSignal(True, "coverage_stable_at_target", 0.95)
+
+    # Signal 2: Persistent oscillation (3+ direction changes in last 5 scores)
+    if len(recent_scores) >= 5:
+        last_5 = recent_scores[-5:]
+        direction_changes = sum(
+            1 for i in range(1, len(last_5) - 1)
+            if (last_5[i] - last_5[i-1]) * (last_5[i+1] - last_5[i]) < 0
+        )
+        if direction_changes >= 3:
+            avg = sum(last_5) / len(last_5)
+            return StoppingSignal(True, f"oscillating_around_{avg:.2f}", 0.7)
+
+    # Signal 3: Diminishing returns (improvement < 0.02 over last 4 iterations)
+    if len(recent_scores) >= 4:
+        recent_improvement = recent_scores[-1] - recent_scores[-4]
+        if abs(recent_improvement) < 0.02 and iteration > 5:
+            return StoppingSignal(True, "diminishing_returns", 0.6)
+
+    # Signal 4: Single score at target
+    if recent_scores[-1] >= target_coverage:
+        return StoppingSignal(True, "target_reached", 0.9)
+
+    return StoppingSignal(False, "continue", 0.0)
+
+
+def cross_topic_synthesis(store, research_program: str) -> str:
+    """Analyze connections and contradictions across all topics.
+
+    Returns a cross-topic analysis string, or empty if < 2 topics.
+    """
+    index = store.load_index()
+    if len(index.topics) < 2:
+        return ""
+
+    topic_summaries = []
+    for t in index.topics:
+        summary = store.read_summary(t.id)
+        if summary.strip():
+            topic_summaries.append(f"### {t.title} (coverage: {t.coverage:.2f})\n{summary[:1500]}")
+
+    if len(topic_summaries) < 2:
+        return ""
+
+    prompt = f"""You are analyzing research findings across multiple topics to identify connections.
+
+## Research Program
+{research_program}
+
+## Topic Summaries
+{chr(10).join(topic_summaries)}
+
+## Task
+Analyze the topics above and identify:
+1. SHARED CONCEPTS: Core principles or findings that appear across multiple topics
+2. CROSS-TOPIC CONTRADICTIONS: Do any topics contradict each other?
+3. EMERGENT INSIGHTS: What conclusions emerge from viewing topics together that aren't obvious from any single topic?
+4. DEPENDENCY MAP: Which topics support, inform, or build on others?
+
+Be specific and cite which topics you're referencing. Output as concise markdown.
+Keep your response under 500 words — focus on the most important connections only."""
+
+    try:
+        result = llm_call(prompt, max_tokens=2048)
+        return result
+    except Exception as e:
+        print(f"  [cross-topic] Error: {e}")
+        return ""
+
+
+_search_history: list[dict] = []
+
+def record_search_result(query: str, sources: list[str], result_count: int, iteration: int) -> None:
+    """Record search execution for future reference."""
+    _search_history.append({
+        "query": query,
+        "sources": sources,
+        "result_count": result_count,
+        "iteration": iteration,
+    })
+
+def get_failed_search_summary() -> str:
+    """Return a summary of searches that yielded 0 results, for prompt injection."""
+    failed = [h for h in _search_history if h["result_count"] == 0]
+    if not failed:
+        return ""
+    lines = [f"- \"{h['query']}\" via {', '.join(h['sources'])}" for h in failed[-5:]]
+    return "These previous searches returned NO results — avoid similar queries:\n" + "\n".join(lines)
+
+def is_similar_to_failed(query: str, threshold: float = 0.7) -> bool:
+    """Check if a query is too similar to a previously failed query."""
+    failed_queries = [h["query"] for h in _search_history if h["result_count"] == 0]
+    query_words = set(query.lower().split())
+    for fq in failed_queries:
+        fq_words = set(fq.lower().split())
+        if not query_words or not fq_words:
+            continue
+        overlap = len(query_words & fq_words) / max(len(query_words), len(fq_words))
+        if overlap >= threshold:
+            return True
+    return False
+
+
+def check_synthesis_quality(old_summary: str, new_summary: str) -> tuple[bool, str]:
+    """Quick heuristic check: did synthesis improve or degrade the summary?
+
+    Returns: (is_ok, reason)
+    """
+    if not old_summary.strip():
+        return True, "first_synthesis"
+
+    # Check 1: New summary shouldn't be dramatically shorter
+    old_len = len(old_summary)
+    new_len = len(new_summary)
+    if new_len < old_len * 0.5 and old_len > 200:
+        return False, f"summary_shrunk ({new_len} vs {old_len} chars)"
+
+    # Check 2: Citation count shouldn't decrease
+    old_cites = len(re.findall(r'\[([^\]]+)\]', old_summary))
+    new_cites = len(re.findall(r'\[([^\]]+)\]', new_summary))
+    if new_cites < old_cites * 0.5 and old_cites >= 2:
+        return False, f"citations_lost ({new_cites} vs {old_cites})"
+
+    return True, "ok"
+
+
+def verify_citations_against_sources(summary: str, source_titles: list[str]) -> dict:
+    """Lightweight check: do citations in the summary plausibly match provided sources?
+
+    Returns: {"total": int, "plausible": int, "suspicious": list[str]}
+    """
+    citations = re.findall(r'\[([^\]]+)\]', summary)
+    # Filter out non-citation brackets
+    citations = [c for c in citations if any(ch.isalpha() for ch in c)
+                 and not c.startswith("http") and c not in ("CONFLICT",)]
+
+    source_words = set()
+    for title in source_titles:
+        source_words.update(w.lower() for w in title.split() if len(w) > 3)
+
+    plausible = 0
+    suspicious = []
+    for cite in citations:
+        cite_words = set(w.lower() for w in cite.split() if len(w) > 2)
+        if cite_words & source_words:
+            plausible += 1
+        else:
+            suspicious.append(cite)
+
+    return {"total": len(citations), "plausible": plausible, "suspicious": suspicious}
+
+
 # ── Main Loop ──────────────────────────────────────────────────────────────
 
 
@@ -527,7 +705,7 @@ def run_research_loop(
     iteration = 0
     human_guidance = ""  # Carries guidance from one checkpoint to the next iteration
     evaluator_suggestions: list[str] = []  # Carries evaluator suggestions to next identify_gaps()
-    recent_scores: list[float] = []  # D5: Track recent coverage scores for oscillation detection
+    recent_scores: list[float] = []  # C3: Track scores for stopping analysis
     _last_program_hash = hashlib.md5(research_program.encode()).hexdigest()  # D6: Detect program changes
 
     while iteration < max_iterations:
@@ -567,7 +745,12 @@ def run_research_loop(
         # Step 2: Identify gaps (now uses store)
         print("  Analyzing gaps and planning searches...")
         try:
-            gap_analysis = identify_gaps(research_program, store, human_guidance, evaluator_suggestions, iteration, max_iterations)
+            # C5: Inject failed search context
+            failed_context = get_failed_search_summary()
+            combined_guidance = human_guidance
+            if failed_context:
+                combined_guidance = f"{human_guidance}\n\n{failed_context}" if human_guidance else failed_context
+            gap_analysis = identify_gaps(research_program, store, combined_guidance, evaluator_suggestions, iteration, max_iterations)
             human_guidance = ""  # Consumed
             evaluator_suggestions = []  # Consumed
         except Exception as e:
@@ -647,6 +830,10 @@ def run_research_loop(
             query = plan_entry.get("query", "")
             if not query:
                 continue
+            # C5: Skip queries similar to previously failed ones
+            if is_similar_to_failed(query):
+                print(f"  Skipping similar-to-failed query: {query[:60]}...")
+                continue
             topic_id = plan_entry.get("topic_id", "")
             plan_results = execute_searches([
                 {"query": query, "sources": plan_entry.get("sources", ["duckduckgo"])}
@@ -660,6 +847,13 @@ def run_research_loop(
                 result_topic_map.append(topic_id)
 
         print(f"  Results collected: {len(results)}")
+
+        # C5: Record search history per plan entry
+        for plan_entry in search_plan:
+            query = plan_entry.get("query", "")
+            sources = plan_entry.get("sources", [])
+            per_query_count = len(results) // max(len(search_plan), 1)
+            record_search_result(query, sources, per_query_count, iteration)
 
         if not results:
             print("  No results found. Trying broader search...")
@@ -760,6 +954,19 @@ def run_research_loop(
                 updated_summary = extract_topic_findings(topic_results, research_program, store, tid)
                 # D1: Filter LLM meta-commentary from synthesis output
                 updated_summary = _filter_meta_commentary(updated_summary)
+
+                # C6: Quality gate — check if synthesis degraded the summary
+                existing = store.read_summary(tid)
+                is_ok, reason = check_synthesis_quality(existing, updated_summary)
+                if not is_ok:
+                    print(f"  ⚠️ Quality regression in {tid}: {reason}. Keeping existing summary.")
+                    continue
+
+                # B5: Lightweight citation verification
+                source_titles = [src.get("title", "") for src in unsynthesized]
+                cite_check = verify_citations_against_sources(updated_summary, source_titles)
+                if cite_check["suspicious"]:
+                    print(f"  [citations] {len(cite_check['suspicious'])} unverified citations in {tid}")
                 max_source_id = store.next_source_id() - 1
                 store.write_summary(tid, updated_summary, last_source_id=max_source_id)
 
@@ -775,6 +982,13 @@ def run_research_loop(
             # Regenerate findings.md from summaries
             updated_findings = store.regenerate_findings()
             write_file(FINDINGS_PATH, updated_findings)
+
+            # B4: Cross-topic synthesis (every 3 iterations or on last)
+            if iteration % 3 == 0 or iteration == max_iterations:
+                print("  Running cross-topic synthesis...")
+                cross_analysis = cross_topic_synthesis(store, research_program)
+                if cross_analysis:
+                    print(f"  Cross-topic insights generated ({len(cross_analysis)} chars)")
         except Exception as e:
             print(f"  Error in synthesis: {e}")
             log_iteration(IterationLog(iteration, 0.0, len(results), time.time() - iter_start, "error"), PROGRESS_PATH)
@@ -837,9 +1051,23 @@ def run_research_loop(
             human_guidance = cp2.guidance  # Carry to next iteration's identify_gaps()
             print(f"  Guidance noted for next iteration: \"{human_guidance}\"")
 
-        # Step 7: Check stopping condition
-        if evaluation.coverage_score >= target_coverage:
-            print(f"\n✅ Target coverage reached ({evaluation.coverage_score:.2f} >= {target_coverage})")
+        # Track scores for stopping analysis
+        recent_scores.append(evaluation.coverage_score)
+
+        # Step 7: Multi-signal stopping (C3)
+        stop_signal = should_stop_research(recent_scores, iteration, target_coverage, max_iterations)
+        if stop_signal.should_stop:
+            reasons = {
+                "target_reached": f"Target coverage reached ({evaluation.coverage_score:.2f} >= {target_coverage})",
+                "coverage_stable_at_target": f"Coverage stable at target for 3 iterations",
+                "max_iterations_reached": f"Max iterations ({max_iterations}) reached",
+                "diminishing_returns": "Diminishing returns — coverage plateaued",
+            }
+            reason_msg = reasons.get(stop_signal.reason, stop_signal.reason)
+            if stop_signal.confidence >= 0.8:
+                print(f"\n✅ Stopping: {reason_msg}")
+            else:
+                print(f"\n⚠️ Stopping ({stop_signal.confidence:.0%} confidence): {reason_msg}")
             break
     else:
         print(f"\n⚠️  Max iterations ({max_iterations}) reached.")
