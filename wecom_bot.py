@@ -54,6 +54,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 PROJECT_DIR = Path(__file__).parent
 RUNS_DIR = PROJECT_DIR / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
+FAILED_NOTIFICATIONS_DIR = RUNS_DIR / "_failed_notifications"
 
 BOT_TOKEN = os.environ.get("WECOM_BOT_TOKEN", "")
 BOT_AES_KEY = os.environ.get("WECOM_BOT_AES_KEY", "")
@@ -462,6 +463,21 @@ def _check_and_send_progress(
     return last_lines
 
 
+def _persist_failed_notification(run_id: str, topic: str, message: str, webhook_key: str) -> None:
+    """Save failed notification to disk for later retry."""
+    FAILED_NOTIFICATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    data = {
+        "run_id": run_id,
+        "topic": topic,
+        "message": message,
+        "webhook_key": webhook_key,
+        "failed_at": datetime.now().isoformat(),
+    }
+    path = FAILED_NOTIFICATIONS_DIR / f"{run_id}.json"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[bot] Saved failed notification to {path}")
+
+
 def run_research_async(
     topic: str, webhook_key: str, from_user: str = "",
     response_url: str = "",
@@ -519,6 +535,7 @@ def run_research_async(
             print(f"[bot] _notify succeeded for '{topic}'")
         else:
             print(f"[bot] !! NOTIFICATION FAILED for '{topic}': no channel delivered the message")
+            _persist_failed_notification(run_id, topic, msg, webhook_key)
         return sent
 
     def _run():
@@ -950,6 +967,19 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
                     line += f"\n  > {progress['current_step']}"
                 items.append(line)
             reply_message(f"🔄 正在运行的任务:\n\n" + "\n".join(items), response_url, webhook_key)
+
+        # Retry any failed notifications
+        if FAILED_NOTIFICATIONS_DIR.exists():
+            for nf in sorted(FAILED_NOTIFICATIONS_DIR.iterdir()):
+                if nf.suffix != ".json":
+                    continue
+                try:
+                    data = json.loads(nf.read_text(encoding="utf-8"))
+                    if reply_message(data["message"], webhook_key=webhook_key):
+                        nf.unlink()
+                        print(f"[bot] Retried and delivered failed notification: {nf.name}")
+                except Exception as e:
+                    print(f"[bot] Failed to retry notification {nf.name}: {e}")
 
     elif "取消" in text_lower or text_lower.startswith("cancel"):
         # Cancel a running task by substring match
