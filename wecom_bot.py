@@ -31,6 +31,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -39,9 +40,9 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse, unquote
 
 import httpx
@@ -1066,8 +1067,27 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
             )
 
 
-class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
+class ThreadPoolHTTPServer(HTTPServer):
+    """HTTP server with a bounded thread pool instead of unbounded ThreadingMixIn."""
+
+    def __init__(self, *args, max_workers: int = 20, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pool = ThreadPoolExecutor(max_workers=max_workers)
+
+    def process_request(self, request, client_address):
+        self._pool.submit(self._process_request_thread, request, client_address)
+
+    def _process_request_thread(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+
+    def server_close(self):
+        super().server_close()
+        self._pool.shutdown(wait=False)
 
 
 class WeComBotHandler(BaseHTTPRequestHandler):
@@ -1250,7 +1270,7 @@ def main():
         print("   notifications will be SILENTLY LOST.")
         print("   Set WECOM_BOT_KEY in your environment to fix this.")
 
-    server = ThreadingHTTPServer((args.host, args.port), WeComBotHandler)
+    server = ThreadPoolHTTPServer((args.host, args.port), WeComBotHandler)
     print(f"🤖 WeCom bot listening on http://{args.host}:{args.port}")
     print(f"   Callback URL: https://research.szfluent.cn/callback")
     print(f"   Model: {DEFAULT_MODEL}")
@@ -1259,11 +1279,23 @@ def main():
     print(f"   Debug mode: {'on' if DEBUG else 'off'}")
     print(f"   Encryption: {'✅ enabled' if _crypt else '❌ disabled'}")
 
+    def _shutdown_handler(signum, frame):
+        print(f"\n[bot] Received signal {signum}, shutting down gracefully...")
+        # Terminate all running research tasks
+        with _tasks_lock:
+            for key, info in list(_running_tasks.items()):
+                if info.proc and info.proc.poll() is None:
+                    print(f"[bot] Terminating task: {key}")
+                    info.proc.terminate()
+        # Stop the server
+        server.shutdown()
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[bot] Shutting down...")
-        server.server_close()
+        _shutdown_handler(signal.SIGINT, None)
 
 
 if __name__ == "__main__":
