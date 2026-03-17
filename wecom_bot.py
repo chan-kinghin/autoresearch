@@ -495,7 +495,8 @@ def run_research_async(
         Uses the freshest response_url available — either updated by a recent
         '状态' check or the original from the research request.
         """
-        fresh_url = task_info.response_url  # May have been refreshed by status checks
+        with _tasks_lock:
+            fresh_url = task_info.response_url  # May have been refreshed by status checks
         print(f"[bot] _notify for '{topic}': response_url={'set' if fresh_url else 'EMPTY'}, webhook_key={'set' if webhook_key else 'EMPTY'}")
         sent = reply_message(msg, response_url=fresh_url, webhook_key=webhook_key)
         if sent:
@@ -529,9 +530,8 @@ def run_research_async(
             # Write to log files instead of PIPE to avoid pipe buffer deadlock.
             # research.py produces heavy output that fills the 64KB pipe buffer,
             # blocking the subprocess forever.
-            fout = open(stdout_log, "w", encoding="utf-8")
-            ferr = open(stderr_log, "w", encoding="utf-8")
-            try:
+            with open(stdout_log, "w", encoding="utf-8") as fout, \
+                 open(stderr_log, "w", encoding="utf-8") as ferr:
                 proc = subprocess.Popen(
                     cmd, stdout=fout, stderr=ferr,
                     cwd=str(work_dir), env=env,
@@ -552,7 +552,7 @@ def run_research_async(
                     if cancelled:
                         proc.terminate()
                         try:
-                            proc.wait(timeout=10)
+                            proc.wait(timeout=30)
                         except subprocess.TimeoutExpired:
                             proc.kill()
                             proc.wait()
@@ -564,8 +564,12 @@ def run_research_async(
 
                     # Check timeout
                     if time.time() > deadline:
-                        proc.kill()
-                        proc.wait()
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait()
                         # Try to send partial results
                         partial_findings = work_dir / "findings.md"
                         if partial_findings.exists():
@@ -578,9 +582,6 @@ def run_research_async(
                         return
 
                     time.sleep(15)
-            finally:
-                fout.close()
-                ferr.close()
 
             elapsed = time.time() - start
 
