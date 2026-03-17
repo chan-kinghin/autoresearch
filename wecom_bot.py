@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -60,6 +61,7 @@ BOT_KEY = os.environ.get("WECOM_BOT_KEY", "")
 DEFAULT_MODEL = os.environ.get("AUTORESEARCH_MODEL", "deepseek-chat")
 DEFAULT_MAX_ITER = int(os.environ.get("AUTORESEARCH_MAX_ITER", "5"))
 
+BOT_BASE_URL = os.environ.get("WECOM_BOT_BASE_URL", "https://research.szfluent.cn")
 DEBUG = os.environ.get("WECOM_BOT_DEBUG", "").lower() in ("1", "true", "yes")
 MAX_CONCURRENT_TASKS = 3
 MAX_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
@@ -234,6 +236,15 @@ except Exception as e:
     print(f"[crypto] Failed to initialize: {e}")
     print("[crypto] Check that WECOM_BOT_AES_KEY is exactly 43 characters")
     _crypt = None
+
+
+# ── Download URL helpers ─────────────────────────────────────────────────
+
+
+def _build_download_url(run_id: str) -> str:
+    """Build an HMAC-signed download URL for a research run's findings."""
+    sig = hmac.new(BOT_TOKEN.encode(), run_id.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{BOT_BASE_URL}/download/{run_id}?sig={sig}"
 
 
 # ── WeCom send helpers ───────────────────────────────────────────────────
@@ -1107,6 +1118,44 @@ class WeComBotHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body.encode("utf-8"))
+            return
+
+        # /download/<run_id> — serve findings.md with HMAC signature verification
+        if parsed.path.startswith("/download/"):
+            run_id = parsed.path[len("/download/"):]
+
+            # Strict run_id validation: only word characters and hyphens
+            if not re.match(r'^[\w\-]{1,80}$', run_id):
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            # Verify HMAC signature
+            query_params = parse_qs(parsed.query)
+            sig = query_params.get("sig", [""])[0]
+            expected_sig = hmac.new(BOT_TOKEN.encode(), run_id.encode(), hashlib.sha256).hexdigest()[:16]
+            if not hmac.compare_digest(sig, expected_sig):
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            # Path canonicalization — prevent traversal
+            findings_path = (RUNS_DIR / run_id / "findings.md").resolve()
+            if not str(findings_path).startswith(str(RUNS_DIR.resolve())):
+                self.send_response(403)
+                self.end_headers()
+                return
+
+            if not findings_path.exists():
+                self.send_response(404)
+                self.end_headers()
+                return
+
+            content = findings_path.read_text(encoding="utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(content.encode("utf-8"))
             return
 
         parsed = urlparse(self.path)
