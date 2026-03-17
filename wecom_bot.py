@@ -391,49 +391,82 @@ def _read_task_progress(work_dir: Path) -> dict:
         except OSError:
             pass
 
-    # Tail stdout.log for current step
-    stdout_path = work_dir / "stdout.log"
-    if stdout_path.exists():
+    # Tail stderr.log for current activity (preferred — research writes status here)
+    stderr_path = work_dir / "stderr.log"
+    if stderr_path.exists():
         try:
-            text = stdout_path.read_text(encoding="utf-8")
-            lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-            # Find the last meaningful line (skip blank lines and progress bars)
-            for line in reversed(lines[-20:]):
-                if line and not line.startswith("[") and not line.startswith("#"):
-                    info["current_step"] = line[:120]
-                    break
-            if not info["current_step"] and lines:
-                info["current_step"] = lines[-1][:120]
+            text = stderr_path.read_text(encoding="utf-8", errors="replace")
+            tail = [l.strip() for l in text.strip().split("\n") if l.strip()]
+            if tail:
+                info["current_step"] = tail[-1][:120]
         except OSError:
             pass
+
+    # Fall back to stdout.log if stderr had nothing
+    if not info["current_step"]:
+        stdout_path = work_dir / "stdout.log"
+        if stdout_path.exists():
+            try:
+                text = stdout_path.read_text(encoding="utf-8")
+                lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+                for line in reversed(lines[-20:]):
+                    if line and not line.startswith("[") and not line.startswith("#"):
+                        info["current_step"] = line[:120]
+                        break
+                if not info["current_step"] and lines:
+                    info["current_step"] = lines[-1][:120]
+            except OSError:
+                pass
 
     return info
 
 
 def _check_and_send_progress(
     work_dir: Path, webhook_key: str, topic: str, last_lines: int,
+    task_info: TaskInfo | None = None,
 ) -> int:
     """Check progress.tsv and send update if new lines appeared. Returns updated last_lines."""
     progress_path = work_dir / "progress.tsv"
-    if not progress_path.exists():
-        return last_lines
-    try:
-        lines = progress_path.read_text(encoding="utf-8").strip().split("\n")
-    except OSError:
-        return last_lines
-    if len(lines) > last_lines and len(lines) > 1:
-        last_lines = len(lines)
-        parts = lines[-1].split("\t")
-        iteration = len(lines) - 1
-        coverage = parts[1] if len(parts) >= 2 else "?"
-        # Use webhook only — response_url expires after ~5s
-        reply_message(f"📊 「{topic}」进度: 第{iteration}轮, 覆盖率 {coverage}", webhook_key=webhook_key)
+    if progress_path.exists():
+        try:
+            lines = progress_path.read_text(encoding="utf-8").strip().split("\n")
+        except OSError:
+            lines = []
+        if len(lines) > last_lines and len(lines) > 1:
+            last_lines = len(lines)
+            parts = lines[-1].split("\t")
+            iteration = len(lines) - 1
+            coverage = parts[1] if len(parts) >= 2 else "?"
+            # Use webhook only — response_url expires after ~5s
+            reply_message(f"📊 「{topic}」进度: 第{iteration}轮, 覆盖率 {coverage}", webhook_key=webhook_key)
+
+    # Send sub-iteration status from stderr (at most once per 2 minutes)
+    if task_info is not None:
+        stderr_log = work_dir / "stderr.log"
+        if stderr_log.exists():
+            try:
+                text = stderr_log.read_text(encoding="utf-8", errors="replace")
+                tail = text.strip().split("\n")
+                last_meaningful = [l.strip() for l in tail[-5:] if l.strip()]
+                if last_meaningful:
+                    current_activity = last_meaningful[-1][:100]
+                    if current_activity != task_info.last_activity:
+                        task_info.last_activity = current_activity
+                        now = time.time()
+                        if now - task_info.last_activity_sent >= 120:
+                            task_info.last_activity_sent = now
+                            send_wecom_markdown(webhook_key, f"⏳ 「{topic}」: {current_activity}")
+            except OSError:
+                pass
+
     return last_lines
 
 
 def run_research_async(
     topic: str, webhook_key: str, from_user: str = "",
     response_url: str = "",
+    max_iterations: int = DEFAULT_MAX_ITER,
+    target_coverage: float = DEFAULT_TARGET_COVERAGE,
 ) -> None:
     """Run research in a background thread and send results to WeCom."""
     task_key = topic if len(topic) <= 80 else topic[:40] + "..." + hashlib.md5(topic.encode()).hexdigest()[:8]
@@ -500,8 +533,8 @@ def run_research_async(
             cmd = [
                 sys.executable, str(PROJECT_DIR / "research.py"),
                 "--mode", "auto",
-                "--max-iterations", str(DEFAULT_MAX_ITER),
-                "--target-coverage", "0.8",
+                "--max-iterations", str(max_iterations),
+                "--target-coverage", str(target_coverage),
                 "--time-budget", "60",
             ]
 
@@ -542,7 +575,7 @@ def run_research_async(
                         return
 
                     # Poll progress via webhook (response_url is reserved for final result)
-                    last_lines = _check_and_send_progress(work_dir, webhook_key, topic, last_lines)
+                    last_lines = _check_and_send_progress(work_dir, webhook_key, topic, last_lines, task_info)
 
                     # Check timeout
                     if time.time() > deadline:
@@ -822,6 +855,18 @@ INTRO_TEXT = """**🔬 研究助手 — AutoResearch Bot**
 - `帮助` — 显示本说明"""
 
 
+HELP_BRIEF = (
+    "🤖 **AutoResearch Bot**\n\n"
+    "**命令：**\n"
+    "- `研究 <主题>` — 启动研究\n"
+    "- `状态` — 查看运行中的任务\n"
+    "- `结果 [关键词]` — 查看研究报告\n"
+    "- `取消 <关键词>` — 取消任务\n"
+    "- `历史` — 最近10次研究\n\n"
+    "发送 `帮助 详细` 查看完整使用指南"
+)
+
+
 def handle_message(text: str, from_user: str, response_url: str = "", webhook_key: str = "") -> None:
     """Route a message to the appropriate handler."""
     text_lower = text.lower().strip()
@@ -852,9 +897,12 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
 
         reply_message("\n".join(diag_lines), response_url, webhook_key)
 
+    elif text_lower in ("帮助 详细", "帮助 全部", "help detail", "help full"):
+        reply_message(INTRO_TEXT, response_url, webhook_key)
+
     elif text_lower in ("帮助", "help", "?", "？", "你可以做什么", "你能做什么",
                        "介绍", "你是谁", "hi", "hello", "你好"):
-        reply_message(INTRO_TEXT, response_url, webhook_key)
+        reply_message(HELP_BRIEF, response_url, webhook_key)
 
     elif text_lower in ("状态", "status") or text_lower.startswith(("状态 ", "status ")):
         detail_query = ""
@@ -922,6 +970,15 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
                 matched = [k for k in task_keys if cancel_query in k.lower()]
                 if len(matched) == 1:
                     matched_key = matched[0]
+                    with _tasks_lock:
+                        info = _running_tasks.get(matched_key)
+                    # Ownership check: only the creator can cancel
+                    if info and info.from_user and from_user and info.from_user != from_user:
+                        reply_message(
+                            f"⚠️ 该任务由 {info.from_user} 创建，只有创建者可以取消。",
+                            response_url, webhook_key,
+                        )
+                        return
                     with _tasks_lock:
                         task = _running_tasks.pop(matched_key, None)
                     # Terminate outside lock to avoid blocking other threads
@@ -1029,10 +1086,17 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
         else:
             topic = ""
         if topic:
+            topic, max_iter, target_cov = _parse_research_params(topic)
             # Reserve response_url for async research result (it can only be used ONCE).
             # Send immediate ack via webhook only; if no webhook, skip ack.
-            reply_message(f"🔬 收到！开始研究「{topic}」...", webhook_key=webhook_key)
-            run_research_async(topic, webhook_key, from_user, response_url=response_url)
+            params_info = ""
+            if max_iter != DEFAULT_MAX_ITER:
+                params_info += f"\n- 最大迭代: {max_iter}轮"
+            if target_cov != DEFAULT_TARGET_COVERAGE:
+                params_info += f"\n- 目标覆盖率: {target_cov}"
+            reply_message(f"🔬 收到！开始研究「{topic}」...{params_info}", webhook_key=webhook_key)
+            run_research_async(topic, webhook_key, from_user, response_url=response_url,
+                               max_iterations=max_iter, target_coverage=target_cov)
         else:
             reply_message("请提供研究主题，例如: `研究 潜水蛙鞋设计`", response_url, webhook_key)
 
@@ -1041,9 +1105,16 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
         # The bot's primary purpose is research — no need to force a "研究" prefix.
         topic = text.strip()
         if topic and len(topic) >= 2:
+            topic, max_iter, target_cov = _parse_research_params(topic)
             # Reserve response_url for async research result (one-time use)
-            reply_message(f"🔬 收到！开始研究「{topic}」...", webhook_key=webhook_key)
-            run_research_async(topic, webhook_key, from_user, response_url=response_url)
+            params_info = ""
+            if max_iter != DEFAULT_MAX_ITER:
+                params_info += f"\n- 最大迭代: {max_iter}轮"
+            if target_cov != DEFAULT_TARGET_COVERAGE:
+                params_info += f"\n- 目标覆盖率: {target_cov}"
+            reply_message(f"🔬 收到！开始研究「{topic}」...{params_info}", webhook_key=webhook_key)
+            run_research_async(topic, webhook_key, from_user, response_url=response_url,
+                               max_iterations=max_iter, target_coverage=target_cov)
         else:
             reply_message(
                 "请发送研究主题，例如: `潜水蛙鞋设计`\n"
