@@ -368,40 +368,6 @@ def generate_research_program(topic: str) -> str:
 """
 
 
-def _send_findings_as_messages(findings: str, response_url: str = "", webhook_key: str = "") -> None:
-    """Split findings.md content into topic sections and send each as a WeCom message."""
-    body = findings.strip()
-    # Remove auto-generated header lines
-    for prefix in ("# Research Findings", "> Auto-generated"):
-        body = "\n".join(
-            l for l in body.split("\n")
-            if not l.strip().startswith(prefix)
-        )
-    sections = [s.strip() for s in body.split("\n---\n") if s.strip()]
-    for i, section in enumerate(sections):
-        # Only the first chunk uses response_url (one-time use); rest go via webhook
-        url = response_url if i == 0 else ""
-        if len(section) > 3800:
-            # Chunk long sections at newline boundaries
-            chunk_start = 0
-            chunk_idx = 0
-            while chunk_start < len(section):
-                chunk = section[chunk_start:chunk_start + 3800]
-                if chunk_start + 3800 < len(section):
-                    last_nl = chunk.rfind("\n")
-                    if last_nl > 2000:
-                        chunk = section[chunk_start:chunk_start + last_nl]
-                        chunk_start += last_nl + 1
-                    else:
-                        chunk_start += 3800
-                else:
-                    chunk_start = len(section)
-                # Use response_url only for the very first chunk
-                chunk_url = url if chunk_idx == 0 else ""
-                reply_message(chunk, response_url=chunk_url, webhook_key=webhook_key)
-                chunk_idx += 1
-        else:
-            reply_message(section, response_url=url, webhook_key=webhook_key)
 
 
 def _read_task_progress(work_dir: Path) -> dict:
@@ -623,7 +589,7 @@ def run_research_async(
                     f"- 最终覆盖率: {last_coverage}\n"
                     f"- 耗时: {elapsed:.0f}s\n"
                     f"- 运行ID: `{run_id}`\n\n"
-                    f"发送 `结果` 查看完整研究报告"
+                    f"[📥 下载完整报告]({_build_download_url(run_id)})"
                 )
                 _notify(summary)
 
@@ -985,12 +951,13 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
                 findings = findings_path.read_text(encoding="utf-8")
                 if findings.strip():
                     progress = _read_task_progress(info.work_dir)
+                    run_id = info.work_dir.name
                     header = (
                         f"📝 **「{k}」中间结果**\n"
-                        f"第{progress['iteration']}轮 | 覆盖率 {progress['coverage']} | 来源 {progress['sources']}"
+                        f"第{progress['iteration']}轮 | 覆盖率 {progress['coverage']} | 来源 {progress['sources']}\n\n"
+                        f"[📥 下载当前报告]({_build_download_url(run_id)})"
                     )
                     reply_message(header, response_url, webhook_key)
-                    _send_findings_as_messages(findings, response_url="", webhook_key=webhook_key)
                 else:
                     reply_message(f"「{k}」尚未产生研究结果，请稍后再试", response_url, webhook_key)
             else:
@@ -1024,9 +991,12 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
                     break
 
             if found_findings and found_findings.strip():
-                header = f"📋 **研究报告：{found_topic}**\n运行ID: `{found_run_id}`"
+                header = (
+                    f"📋 **研究报告：{found_topic}**\n"
+                    f"运行ID: `{found_run_id}`\n\n"
+                    f"[📥 下载完整报告]({_build_download_url(found_run_id)})"
+                )
                 reply_message(header, response_url, webhook_key)
-                _send_findings_as_messages(found_findings, response_url="", webhook_key=webhook_key)
             else:
                 reply_message("未找到研究结果。发送 `历史` 查看已完成的研究列表。", response_url, webhook_key)
 
