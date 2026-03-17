@@ -62,6 +62,7 @@ BOT_RECEIVE_ID = os.environ.get("WECOM_BOT_RECEIVE_ID", "")
 BOT_KEY = os.environ.get("WECOM_BOT_KEY", "")
 DEFAULT_MODEL = os.environ.get("AUTORESEARCH_MODEL", "deepseek-chat")
 DEFAULT_MAX_ITER = int(os.environ.get("AUTORESEARCH_MAX_ITER", "5"))
+DEFAULT_TARGET_COVERAGE = 0.85
 
 BOT_BASE_URL = os.environ.get("WECOM_BOT_BASE_URL", "https://research.szfluent.cn")
 DEBUG = os.environ.get("WECOM_BOT_DEBUG", "").lower() in ("1", "true", "yes")
