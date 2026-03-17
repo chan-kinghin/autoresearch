@@ -11,6 +11,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -109,6 +110,10 @@ class IterationLog:
 # ── LLM Calls ─────────────────────────────────────────────────────────────
 
 
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_RETRY_DELAYS = [1, 2, 4]
+
+
 def _call_anthropic(
     model_id: str, system: str, prompt: str, max_tokens: int, temperature: float
 ) -> str:
@@ -117,24 +122,41 @@ def _call_anthropic(
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
 
+    last_exc: Exception | None = None
     with httpx.Client(timeout=LLM_TIMEOUT) as client:
-        resp = client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": model_id,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "system": system,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        for attempt in range(1, len(_RETRY_DELAYS) + 2):  # 1..4 (max 3 retries)
+            try:
+                resp = client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": model_id,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "system": system,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                if resp.status_code in _RETRYABLE_STATUS and attempt <= len(_RETRY_DELAYS):
+                    print(f"  [llm] Retry {attempt}/3 after {resp.status_code}...")
+                    time.sleep(_RETRY_DELAYS[attempt - 1])
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except httpx.TimeoutException as e:
+                last_exc = e
+                if attempt <= len(_RETRY_DELAYS):
+                    print(f"  [llm] Retry {attempt}/3 after timeout...")
+                    time.sleep(_RETRY_DELAYS[attempt - 1])
+                    continue
+                raise
+        else:
+            raise last_exc  # type: ignore[misc]
     content = data.get("content") or []
     if not content or not isinstance(content[0], dict):
         raise ValueError(f"Unexpected Anthropic response shape: {data!r:.200}")
@@ -146,25 +168,42 @@ def _call_openai_compatible(
     system: str, prompt: str, max_tokens: int, temperature: float,
 ) -> str:
     """Call any OpenAI-compatible chat completions API."""
+    last_exc: Exception | None = None
     with httpx.Client(timeout=LLM_TIMEOUT) as client:
-        resp = client.post(
-            base_url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model_id,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        for attempt in range(1, len(_RETRY_DELAYS) + 2):
+            try:
+                resp = client.post(
+                    base_url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model_id,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                    },
+                )
+                if resp.status_code in _RETRYABLE_STATUS and attempt <= len(_RETRY_DELAYS):
+                    print(f"  [llm] Retry {attempt}/3 after {resp.status_code}...")
+                    time.sleep(_RETRY_DELAYS[attempt - 1])
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except httpx.TimeoutException as e:
+                last_exc = e
+                if attempt <= len(_RETRY_DELAYS):
+                    print(f"  [llm] Retry {attempt}/3 after timeout...")
+                    time.sleep(_RETRY_DELAYS[attempt - 1])
+                    continue
+                raise
+        else:
+            raise last_exc  # type: ignore[misc]
     choices = data.get("choices") or []
     if not choices:
         raise ValueError(f"Unexpected OpenAI-compatible response: no choices in {data!r:.200}")
@@ -216,8 +255,16 @@ def llm_json(
     raw = re.sub(r"\s*```\s*$", "", raw)
     try:
         return json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"LLM returned invalid JSON: {e} — raw response: {raw[:200]}") from e
+    except json.JSONDecodeError:
+        pass
+    # Second chance: find first {...} block in raw text
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    raise ValueError(f"LLM returned invalid JSON — raw response: {raw[:200]}")
 
 
 # ── Tier 1: Deep Research Services ─────────────────────────────────────────
@@ -264,7 +311,7 @@ def search_metaso(query: str, mode: str = "research") -> List[SearchResult]:
         if content:
             results.append(SearchResult(
                 title=f"Metaso Research: {query}",
-                url="https://metaso.cn",
+                url=f"https://metaso.cn/search?q={urllib.parse.quote(query)}",
                 snippet=content[:500],
                 source="metaso",
                 full_text=content,
@@ -277,7 +324,7 @@ def search_metaso(query: str, mode: str = "research") -> List[SearchResult]:
                 source="metaso",
             ))
         return results
-    except Exception as e:
+    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError) as e:
         print(f"  [metaso] Error: {e}")
         return []
 
@@ -317,7 +364,7 @@ def search_perplexity(query: str) -> List[SearchResult]:
                     title=citation, url=citation, snippet="", source="perplexity"
                 ))
         return results
-    except Exception as e:
+    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError) as e:
         print(f"  [perplexity] Error: {e}")
         return []
 
@@ -341,13 +388,13 @@ def search_gemini_deep(query: str) -> List[SearchResult]:
         if content:
             return [SearchResult(
                 title=f"Gemini Research: {query}",
-                url="https://gemini.google.com",
+                url=f"gemini-synthesis://{query[:80]}",
                 snippet=content[:500],
                 source="gemini",
                 full_text=content,
             )]
         return []
-    except Exception as e:
+    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError) as e:
         print(f"  [gemini] Error: {e}")
         return []
 
@@ -401,7 +448,7 @@ def search_semantic_scholar(
                 year=str(paper.get("year", "")),
             ))
         return results
-    except Exception as e:
+    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError) as e:
         print(f"  [semantic_scholar] Error: {e}")
         return []
 
@@ -449,7 +496,7 @@ def search_arxiv(query: str, max_results: int = 10) -> List[SearchResult]:
                 year=published,
             ))
         return results
-    except Exception as e:
+    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError) as e:
         print(f"  [arxiv] Error: {e}")
         return []
 
@@ -472,7 +519,10 @@ def search_duckduckgo(query: str, max_results: int = 10) -> List[SearchResult]:
                     source="duckduckgo",
                 ))
         return results
-    except Exception as e:
+    except ImportError:
+        print("  [duckduckgo] Package not installed — run: uv add duckduckgo-search")
+        return []
+    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError) as e:
         print(f"  [duckduckgo] Error: {e}")
         return []
 
@@ -490,15 +540,42 @@ def extract_webpage(url: str) -> str:
             resp.raise_for_status()
         text = trafilatura.extract(resp.text)
         return text or ""
+    except ImportError:
+        print("  [extract] Package not installed — run: uv add trafilatura")
+        return ""
     except httpx.HTTPStatusError as e:
         print(f"  [extract] HTTP {e.response.status_code} for {url}")
         return ""
     except httpx.ConnectError as e:
         print(f"  [extract] Connection failed for {url}: {e}")
         return ""
-    except Exception as e:
+    except (httpx.HTTPError, httpx.TimeoutException, OSError, ValueError) as e:
         print(f"  [extract] Error extracting {url}: {type(e).__name__}: {e}")
         return ""
+
+
+# ── Query Reformulation ────────────────────────────────────────────────────
+
+_QUESTION_WORDS = {"what", "how", "why", "when", "where", "who", "which", "is", "are", "do", "does", "can", "could", "would", "should"}
+
+
+def reformulate_query(query: str, source: str) -> str:
+    """Adapt a natural-language query for a specific search engine."""
+    if source == "arxiv":
+        # Convert to arXiv query syntax: key terms joined with AND
+        words = query.split()
+        terms = [w for w in words if w.lower() not in _QUESTION_WORDS and len(w) > 2]
+        if len(terms) >= 2:
+            # Use first term in title, rest in abstract
+            parts = [f"ti:{terms[0]}"] + [f"abs:{t}" for t in terms[1:]]
+            return " AND ".join(parts)
+        return query
+    if source == "semantic_scholar":
+        # Strip question words, keep noun phrases for keyword search
+        words = query.split()
+        terms = [w for w in words if w.lower() not in _QUESTION_WORDS]
+        return " ".join(terms) if terms else query
+    return query
 
 
 # ── Unified Search ─────────────────────────────────────────────────────────
@@ -531,8 +608,9 @@ def execute_searches(
             if not fn:
                 print(f"  [search] Unknown source: {src}")
                 continue
-            print(f"  Searching {src}: {query[:60]}...")
-            results = fn(query)
+            adapted_query = reformulate_query(query, src)
+            print(f"  Searching {src}: {adapted_query[:60]}...")
+            results = fn(adapted_query)
             for r in results:
                 if r.url and r.url in seen_urls:
                     continue
@@ -543,57 +621,16 @@ def execute_searches(
     return all_results
 
 
-# ── Evaluation ─────────────────────────────────────────────────────────────
-
-
-def evaluate_coverage(
-    research_program: str,
-    findings: str,
-) -> EvaluationResult:
-    """Use LLM-as-judge to evaluate how well findings cover the research program."""
-    prompt = f"""Evaluate how well the current research findings answer the research program.
-
-## Research Program
-{research_program}
-
-## Current Findings
-{findings}
-
-## Instructions
-Score coverage from 0.0 (nothing answered) to 1.0 (fully answered).
-Be strict — only score high if findings are thorough with supporting evidence.
-
-Respond with JSON only:
-{{
-  "coverage_score": <float 0.0-1.0>,
-  "questions_answered": ["list of questions that are well-answered"],
-  "questions_remaining": ["list of questions still unanswered or poorly answered"],
-  "gaps": ["specific knowledge gaps identified"],
-  "suggested_queries": ["2-4 search queries to fill the gaps"]
-}}"""
-
-    try:
-        data = llm_json(prompt)
-        return EvaluationResult(
-            coverage_score=float(data.get("coverage_score", 0.0)),
-            questions_answered=data.get("questions_answered", []),
-            questions_remaining=data.get("questions_remaining", []),
-            gaps=data.get("gaps", []),
-            suggested_queries=data.get("suggested_queries", []),
-        )
-    except Exception as e:
-        print(f"  [evaluate] Error: {e}")
-        return EvaluationResult(coverage_score=0.0, gaps=[str(e)])
-
-
 # ── Progress Logging ───────────────────────────────────────────────────────
 
 
 def init_progress_log(path: str = "progress.tsv") -> None:
-    """Create or reset the progress log file."""
+    """Create the progress log file if it does not already exist."""
     try:
-        with open(path, "w") as f:
-            f.write("iteration\tcoverage\tsources\tduration_s\tstatus\n")
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write("iteration\tcoverage\tsources\tduration_s\tstatus\n")
+        # If file exists, don't overwrite it
     except OSError as e:
         print(f"  [log] Warning: could not create progress log {path}: {e}")
 
