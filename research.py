@@ -377,12 +377,30 @@ def run_research_loop(
         print(f"  Searches planned: {len(search_plan)}")
 
         # Step 2.5: Create any new topics from gap analysis
+        new_topic_ids = set()
         for new_topic in gap_analysis.get("new_topics", []):
             store.add_topic(Topic(
                 id=new_topic["id"],
                 title=new_topic.get("title", new_topic["id"]),
                 keywords=new_topic.get("keywords", []),
             ))
+            new_topic_ids.add(new_topic["id"])
+
+        # Resolve topic_id="new" in search_plan to actual new topic IDs
+        for plan_entry in search_plan:
+            if plan_entry.get("topic_id") == "new":
+                query_lower = plan_entry.get("query", "").lower()
+                matched_id = ""
+                for nt in gap_analysis.get("new_topics", []):
+                    title_words = nt.get("title", "").lower().split()
+                    if any(w in query_lower for w in title_words if len(w) > 3):
+                        matched_id = nt["id"]
+                        break
+                # Fallback: use the first new topic if no keyword match
+                if not matched_id and gap_analysis.get("new_topics"):
+                    matched_id = gap_analysis["new_topics"][0]["id"]
+                if matched_id:
+                    plan_entry["topic_id"] = matched_id
 
         # ── Checkpoint 1: Review search plan before executing ──
         cp1_lines = [f"Gaps: {len(gaps)}"]
@@ -403,20 +421,41 @@ def run_research_loop(
             })
             print(f"  Added user query: \"{cp1.guidance}\"")
 
-        # Step 3: Execute searches
-        queries = [
-            {"query": s.get("query", ""), "sources": s.get("sources", ["duckduckgo"])}
-            for s in search_plan
-            if s.get("query")
-        ]
-        results = execute_searches(queries)
+        # Step 3: Execute searches per plan entry to track topic assignment
+        results: list[SearchResult] = []
+        result_topic_map: list[str] = []  # parallel list: topic_id per result
+        seen_urls: set[str] = set()
+
+        for plan_entry in search_plan:
+            query = plan_entry.get("query", "")
+            if not query:
+                continue
+            topic_id = plan_entry.get("topic_id", "")
+            plan_results = execute_searches([
+                {"query": query, "sources": plan_entry.get("sources", ["duckduckgo"])}
+            ])
+            for r in plan_results:
+                if r.url and r.url in seen_urls:
+                    continue
+                if r.url:
+                    seen_urls.add(r.url)
+                results.append(r)
+                result_topic_map.append(topic_id)
+
         print(f"  Results collected: {len(results)}")
 
         if not results:
             print("  No results found. Trying broader search...")
             # Fallback: use DuckDuckGo with gap descriptions
             fallback_queries = [{"query": g[:120], "sources": ["duckduckgo"]} for g in gaps[:3]]
-            results = execute_searches(fallback_queries)
+            fallback_results = execute_searches(fallback_queries)
+            for r in fallback_results:
+                if r.url and r.url in seen_urls:
+                    continue
+                if r.url:
+                    seen_urls.add(r.url)
+                results.append(r)
+                result_topic_map.append("")  # No specific topic for fallback
             print(f"  Fallback results: {len(results)}")
 
         if not results:
@@ -427,13 +466,13 @@ def run_research_loop(
         # Step 3.5 + 4: Store results and synthesize per-topic (delta merge)
         print("  Synthesizing findings...")
         try:
-            # Build topic mapping from search plan
-            query_topic_map = {}
+            # Determine fallback topic (first valid topic from search plan)
+            fallback_topic = ""
             for plan_entry in search_plan:
-                q = plan_entry.get("query", "")
                 tid = plan_entry.get("topic_id", "")
-                if q and tid:
-                    query_topic_map[q] = tid
+                if tid:
+                    fallback_topic = tid
+                    break
 
             # Save raw results
             store.save_raw_results(iteration, [
@@ -442,14 +481,8 @@ def run_research_loop(
             ])
 
             # Assign results to topics and store as sources
-            for result in results:
-                # Default: use first topic_id from search_plan or empty
-                assigned_topic = ""
-                for plan_entry in search_plan:
-                    tid = plan_entry.get("topic_id", "")
-                    if tid and tid != "new":
-                        assigned_topic = tid
-                        break
+            for i, result in enumerate(results):
+                assigned_topic = result_topic_map[i] if result_topic_map[i] else fallback_topic
 
                 source_id = store.next_source_id()
                 topic_ids = [assigned_topic] if assigned_topic else []
@@ -469,7 +502,7 @@ def run_research_loop(
             topics_from_plan = set()
             for plan_entry in search_plan:
                 tid = plan_entry.get("topic_id", "")
-                if tid and tid != "new":
+                if tid:
                     topics_from_plan.add(tid)
 
             # Combine: stale topics first, then plan topics
