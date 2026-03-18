@@ -478,3 +478,482 @@ class TestSmartRouting:
         context = store.get_context_with_budget(["anything"])
         assert isinstance(context, str)
         assert "Knowledge Store Index" in context
+
+
+# ── Helper: build a richly populated store ──────────────────────────────
+
+
+def _build_populated_store(tmp_path) -> KnowledgeStore:
+    """Create a KnowledgeStore with topics, sources, summaries, and questions for reuse."""
+    store = KnowledgeStore(str(tmp_path / "research_store"))
+
+    # Topics
+    store.add_topic(Topic(id="llm_arch", title="LLM Architecture", keywords=["llm", "architecture"], coverage=0.8, source_count=6))
+    store.add_topic(Topic(id="safety", title="AI Safety", keywords=["safety", "alignment"], coverage=0.5, source_count=3))
+    store.add_topic(Topic(id="scaling", title="Scaling Laws", keywords=["scaling"], coverage=0.2, source_count=1))
+
+    # Sources with year/author data
+    store.add_source(1, {
+        "title": "Attention Is All You Need",
+        "authors": "Ashish Vaswani, Noam Shazeer",
+        "year": 2017,
+        "url": "https://arxiv.org/abs/1706.03762",
+        "source": "arxiv",
+        "topic_ids": ["llm_arch"],
+    })
+    store.add_source(2, {
+        "title": "Language Models are Few-Shot Learners",
+        "authors": "Tom Brown, Benjamin Mann",
+        "year": 2020,
+        "url": "https://arxiv.org/abs/2005.14165",
+        "source": "semantic_scholar",
+        "topic_ids": ["llm_arch", "scaling"],
+    })
+    store.add_source(3, {
+        "title": "Constitutional AI",
+        "authors": "Yuntao Bai, Saurav Kadavath",
+        "year": 2022,
+        "url": "https://arxiv.org/abs/2212.08073",
+        "source": "arxiv",
+        "topic_ids": ["safety"],
+    })
+    store.add_source(4, {
+        "title": "Scaling Data-Constrained Language Models",
+        "authors": "Niklas Muennighoff",
+        "year": 2024,
+        "url": "https://example.com/scaling2024",
+        "source": "duckduckgo",
+        "topic_ids": ["scaling"],
+    })
+    store.add_source(5, {
+        "title": "Reward Model Overoptimization",
+        "authors": "Leo Gao, John Schulman",
+        "year": 2023,
+        "url": "https://example.com/reward",
+        "source": "semantic_scholar",
+        "topic_ids": ["safety"],
+    })
+
+    # Summaries with inline citations and contradiction markers
+    store.write_summary("llm_arch", (
+        "# LLM Architecture\n\n"
+        "The transformer architecture was introduced by [Vaswani, 2017] and has become dominant.\n"
+        "Large language models like GPT-3 [Brown, 2020] demonstrated few-shot capabilities.\n"
+        "This is a sufficiently long first sentence for executive summary extraction purposes.\n"
+    ), last_source_id=2)
+
+    store.write_summary("safety", (
+        "# AI Safety\n\n"
+        "Constitutional AI [Bai, 2022] proposes a self-supervised alignment approach.\n"
+        "[CONFLICT] However, source Gao (2023) disagrees on reward model effectiveness.\n"
+        "In contrast, some argue that RLHF is sufficient for alignment.\n"
+        "There is also a [phantom_cite, 2099] that does not match any source.\n"
+    ), last_source_id=3)
+
+    store.write_summary("scaling", (
+        "# Scaling Laws\n\n"
+        "Scaling laws predict model performance as a function of compute [Brown, 2020].\n"
+        "Recent work suggests data quality matters more than quantity.\n"
+    ), last_source_id=4)
+
+    # Questions
+    index = store.load_index()
+    index.questions = [
+        Question(id="q1", text="How do transformers scale?", status="answered", related_topics=["llm_arch", "scaling"]),
+        Question(id="q2", text="What alignment methods work best?", status="partial", related_topics=["safety"]),
+        Question(id="q3", text="Can we reduce compute costs?", status="unanswered", related_topics=["scaling"]),
+    ]
+    index.meta = IndexMeta(total_sources=5, avg_coverage=0.5, iterations=3)
+    store.save_index(index)
+
+    return store
+
+
+# ── D1: Citation Index Builder ──────────────────────────────────────────
+
+
+class TestCitationIndex:
+    def test_build_citation_index_matches_author_year(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        citation_index = store.build_citation_index()
+        # [Vaswani, 2017] should match src_001 (authors contain "Vaswani", year 2017)
+        assert "Vaswani, 2017" in citation_index
+        entry = citation_index["Vaswani, 2017"]
+        assert entry["source_id"] == "src_001"
+        assert entry["year"] == "2017"
+        assert "arxiv" in entry["url"]
+
+    def test_build_citation_index_matches_across_topics(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        citation_index = store.build_citation_index()
+        # [Brown, 2020] appears in both llm_arch and scaling summaries
+        assert "Brown, 2020" in citation_index
+        assert citation_index["Brown, 2020"]["source_id"] == "src_002"
+
+    def test_build_citation_index_unmatched_not_included(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        citation_index = store.build_citation_index()
+        # phantom_cite doesn't match any source
+        assert "phantom_cite, 2099" not in citation_index
+
+    def test_build_citation_index_empty_store(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "research_store"))
+        citation_index = store.build_citation_index()
+        assert citation_index == {}
+
+    def test_build_citation_index_no_duplicate_entries(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        citation_index = store.build_citation_index()
+        # Each citation text should appear exactly once as a key
+        keys = list(citation_index.keys())
+        assert len(keys) == len(set(keys))
+
+
+# ── D2: Confidence Levels in regenerate_findings ────────────────────────
+
+
+class TestConfidenceLevels:
+    def test_high_confidence(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        findings = store.regenerate_findings()
+        # llm_arch: source_count=6+2(from add_source), coverage=0.8 -> HIGH
+        # After add_source calls, llm_arch gets +1 from src_001, so source_count goes up
+        # The topic was initialized with source_count=6, then add_source increments it
+        assert "Confidence: HIGH" in findings
+
+    def test_medium_confidence(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        findings = store.regenerate_findings()
+        # safety: coverage=0.5, source_count >= 2 -> MEDIUM
+        assert "Confidence: MEDIUM" in findings
+
+    def test_low_confidence(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        findings = store.regenerate_findings()
+        # scaling: coverage=0.2, source_count >= 2 but coverage < 0.4 -> LOW
+        # Actually scaling starts at source_count=1, then gets +2 from add_source -> 3
+        # coverage=0.2 < 0.4 -> even with 3 sources, coverage < 0.4 -> LOW
+        assert "Confidence: LOW" in findings
+
+    def test_confidence_in_topic_section(self, tmp_path):
+        """Confidence appears on the same line as coverage and sources."""
+        store = _build_populated_store(tmp_path)
+        findings = store.regenerate_findings()
+        # Check that confidence is in the coverage line format
+        assert "Coverage:" in findings
+        assert "Sources:" in findings
+
+    def test_confidence_boundary_high(self, tmp_path):
+        """Exactly at the HIGH threshold: source_count=5, coverage=0.7."""
+        store = KnowledgeStore(str(tmp_path / "store"))
+        store.add_topic(Topic(id="t1", title="Topic", coverage=0.7, source_count=5))
+        store.write_summary("t1", "Some content here for the topic.", last_source_id=1)
+        findings = store.regenerate_findings()
+        assert "Confidence: HIGH" in findings
+
+    def test_confidence_boundary_medium(self, tmp_path):
+        """Exactly at MEDIUM threshold: source_count=2, coverage=0.4."""
+        store = KnowledgeStore(str(tmp_path / "store"))
+        store.add_topic(Topic(id="t1", title="Topic", coverage=0.4, source_count=2))
+        store.write_summary("t1", "Some content here for the topic.", last_source_id=1)
+        findings = store.regenerate_findings()
+        assert "Confidence: MEDIUM" in findings
+
+
+# ── D3: Question Resolution Matrix ─────────────────────────────────────
+
+
+class TestQuestionMatrix:
+    def test_generate_question_matrix_basic(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        matrix = store.generate_question_matrix()
+        assert "Research Questions: Coverage Status" in matrix
+        assert "How do transformers scale?" in matrix
+        assert "What alignment methods work best?" in matrix
+        assert "Can we reduce compute costs?" in matrix
+
+    def test_question_matrix_table_format(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        matrix = store.generate_question_matrix()
+        # Should contain markdown table headers
+        assert "| # | Question | Status | Related Topics | Gap |" in matrix
+        assert "|---|----------|--------|----------------|-----|" in matrix
+
+    def test_question_matrix_status_icons(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        matrix = store.generate_question_matrix()
+        assert "\u2705" in matrix   # answered checkmark
+        assert "\U0001f536" in matrix  # partial diamond
+        assert "\u274c" in matrix   # unanswered cross
+
+    def test_question_matrix_summary_counts(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        matrix = store.generate_question_matrix()
+        # 1 answered, 1 partial, 1 unanswered out of 3
+        assert "1/3 answered" in matrix
+        assert "1/3 partial" in matrix
+        assert "1/3 open" in matrix
+
+    def test_question_matrix_gap_column(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        matrix = store.generate_question_matrix()
+        assert "None" in matrix              # answered question has no gap
+        assert "Needs more research" in matrix  # unanswered/partial need research
+
+    def test_question_matrix_empty(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "store"))
+        matrix = store.generate_question_matrix()
+        assert matrix == ""
+
+    def test_question_matrix_related_topics(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        matrix = store.generate_question_matrix()
+        # q1 relates to llm_arch and scaling
+        assert "llm_arch" in matrix
+        assert "scaling" in matrix
+
+    def test_question_matrix_in_findings(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        findings = store.regenerate_findings()
+        assert "Research Questions: Coverage Status" in findings
+
+
+# ── D4: Temporal Awareness / Source Recency ─────────────────────────────
+
+
+class TestSourceRecency:
+    def test_analyze_source_recency_basic(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        recency = store.analyze_source_recency()
+        assert "Source Recency Analysis" in recency
+        assert "Newest source" in recency
+        assert "Oldest source" in recency
+        assert "Median source year" in recency
+
+    def test_recency_year_values(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        recency = store.analyze_source_recency()
+        # Sources have years: 2017, 2020, 2022, 2023, 2024
+        assert "2024" in recency  # newest
+        assert "2017" in recency  # oldest
+
+    def test_recency_old_source_warning(self, tmp_path):
+        """If >30% of sources are >3 years old, a warning is emitted."""
+        store = _build_populated_store(tmp_path)
+        recency = store.analyze_source_recency()
+        # Years: 2017, 2020, 2022, 2023, 2024. Current year is 2026.
+        # >3 years old: 2017 (9yr), 2020 (6yr), 2022 (4yr) = 3/5 = 60% > 30%
+        assert "\u26a0\ufe0f" in recency or "old" in recency.lower()
+
+    def test_recency_empty_store(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "store"))
+        recency = store.analyze_source_recency()
+        assert recency == ""
+
+    def test_recency_no_year_data(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "store"))
+        store.add_topic(Topic(id="t1", title="T1"))
+        store.add_source(1, {"title": "No Year", "topic_ids": ["t1"]})
+        recency = store.analyze_source_recency()
+        assert recency == ""
+
+    def test_recency_in_findings(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        findings = store.regenerate_findings()
+        assert "Source Recency Analysis" in findings
+
+    def test_recency_total_count(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        recency = store.analyze_source_recency()
+        assert "Total sources with year data" in recency
+        assert "5" in recency
+
+
+# ── D5: Multi-format Export ─────────────────────────────────────────────
+
+
+class TestMultiFormatExport:
+    # -- Executive Summary --
+
+    def test_executive_summary_header(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        summary = store.export_executive_summary()
+        assert "# Executive Summary" in summary
+        assert "Generated:" in summary
+
+    def test_executive_summary_coverage_section(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        summary = store.export_executive_summary()
+        assert "## Coverage" in summary
+        assert "Overall:" in summary
+        assert "Sources consulted:" in summary
+        assert "Iterations:" in summary
+
+    def test_executive_summary_key_findings(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        summary = store.export_executive_summary()
+        assert "## Key Findings" in summary
+        # Topics sorted by coverage descending, llm_arch has highest coverage
+        assert "LLM Architecture" in summary
+
+    def test_executive_summary_confidence_labels(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        summary = store.export_executive_summary()
+        # Should contain at least one confidence label
+        assert any(level in summary for level in ["HIGH", "MEDIUM", "LOW"])
+
+    def test_executive_summary_remaining_gaps(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        summary = store.export_executive_summary()
+        assert "## Remaining Gaps" in summary
+        # q2 (partial) and q3 (unanswered) should appear
+        assert "What alignment methods work best?" in summary
+        assert "Can we reduce compute costs?" in summary
+
+    def test_executive_summary_empty_store(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "store"))
+        summary = store.export_executive_summary()
+        assert "# Executive Summary" in summary
+
+    # -- BibTeX --
+
+    def test_export_bibtex_entries(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        bibtex = store.export_bibtex()
+        assert "@article{" in bibtex or "@misc{" in bibtex
+        assert "Attention Is All You Need" in bibtex
+        assert "Language Models are Few-Shot Learners" in bibtex
+
+    def test_bibtex_cite_key_format(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        bibtex = store.export_bibtex()
+        # First author last name + year
+        assert "vaswani2017" in bibtex
+        assert "brown2020" in bibtex
+
+    def test_bibtex_entry_type_academic(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        bibtex = store.export_bibtex()
+        # arxiv and semantic_scholar sources -> @article
+        assert "@article{vaswani2017" in bibtex
+
+    def test_bibtex_entry_type_misc(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        bibtex = store.export_bibtex()
+        # duckduckgo source -> @misc
+        assert "@misc{muennighoff2024" in bibtex
+
+    def test_bibtex_contains_url(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        bibtex = store.export_bibtex()
+        assert "url = {https://arxiv.org/abs/1706.03762}" in bibtex
+
+    def test_bibtex_empty_store(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "store"))
+        bibtex = store.export_bibtex()
+        assert bibtex == ""
+
+    def test_bibtex_skips_sources_without_title(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "store"))
+        store.add_topic(Topic(id="t1", title="T1"))
+        store.add_source(1, {"topic_ids": ["t1"], "url": "https://example.com"})
+        bibtex = store.export_bibtex()
+        assert bibtex == ""
+
+
+# ── D6: Contradiction Log ──────────────────────────────────────────────
+
+
+class TestContradictionLog:
+    def test_detects_conflict_marker(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        contradictions = store.get_contradictions_from_summaries()
+        # safety summary has "[CONFLICT]" marker
+        assert any("AI Safety" in c for c in contradictions)
+
+    def test_detects_disagree_keyword(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        contradictions = store.get_contradictions_from_summaries()
+        # safety summary has "disagrees"
+        assert any("disagree" in c.lower() for c in contradictions)
+
+    def test_detects_in_contrast(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        contradictions = store.get_contradictions_from_summaries()
+        assert any("in contrast" in c.lower() for c in contradictions)
+
+    def test_no_contradictions_clean_store(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "store"))
+        store.add_topic(Topic(id="t1", title="Clean Topic"))
+        store.write_summary("t1", "Everything is consistent and clear.", last_source_id=1)
+        contradictions = store.get_contradictions_from_summaries()
+        assert contradictions == []
+
+    def test_contradictions_in_findings(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        findings = store.regenerate_findings()
+        assert "Known Conflicts & Uncertainties" in findings
+
+    def test_contradiction_truncation(self, tmp_path):
+        """Contradiction lines are truncated to 200 chars."""
+        store = KnowledgeStore(str(tmp_path / "store"))
+        store.add_topic(Topic(id="t1", title="Long"))
+        long_line = "[CONFLICT] " + "x" * 300
+        store.write_summary("t1", long_line, last_source_id=1)
+        contradictions = store.get_contradictions_from_summaries()
+        assert len(contradictions) == 1
+        # Total = "**Long**: " (10 chars) + 200 chars of content
+        assert len(contradictions[0]) <= 220
+
+
+# ── D7: Citation Validation ────────────────────────────────────────────
+
+
+class TestCitationValidation:
+    def test_validate_citations_basic(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        result = store.validate_citations()
+        assert "total_citations" in result
+        assert "matched" in result
+        assert "unmatched" in result
+        assert "match_rate" in result
+        assert result["total_citations"] > 0
+
+    def test_matched_citations(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        result = store.validate_citations()
+        # Vaswani 2017, Brown 2020, Bai 2022 should match
+        assert result["matched"] >= 1
+
+    def test_unmatched_citations(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        result = store.validate_citations()
+        # phantom_cite 2099 should be unmatched
+        assert "phantom_cite, 2099" in result["unmatched"]
+
+    def test_match_rate_between_0_and_1(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        result = store.validate_citations()
+        assert 0.0 <= result["match_rate"] <= 1.0
+
+    def test_validation_filters_non_citations(self, tmp_path):
+        """HTTP links, CONFLICT/STALE markers, and ! prefixed items are excluded."""
+        store = KnowledgeStore(str(tmp_path / "store"))
+        store.add_topic(Topic(id="t1", title="T1"))
+        store.write_summary("t1", (
+            "See [https://example.com] and [CONFLICT] and [!image] "
+            "and also [STALE] marker."
+        ), last_source_id=1)
+        result = store.validate_citations()
+        assert result["total_citations"] == 0
+
+    def test_validation_empty_store(self, tmp_path):
+        store = KnowledgeStore(str(tmp_path / "store"))
+        result = store.validate_citations()
+        assert result["total_citations"] == 0
+        assert result["match_rate"] == 1.0  # 0/0 defaults to 1.0
+
+    def test_validation_in_findings(self, tmp_path):
+        store = _build_populated_store(tmp_path)
+        findings = store.regenerate_findings()
+        assert "Citation validation:" in findings

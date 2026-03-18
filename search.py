@@ -559,7 +559,7 @@ def search_gemini_deep(query: str) -> List[SearchResult]:
                 full_text=content,
             )]
         return []
-    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError) as e:
+    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError, Exception) as e:
         print(f"  [gemini] Error: {e}")
         return []
 
@@ -661,7 +661,7 @@ def search_arxiv(query: str, max_results: int = 10) -> List[SearchResult]:
                 year=published,
             ))
         return results
-    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError) as e:
+    except (httpx.HTTPError, httpx.TimeoutException, json.JSONDecodeError, OSError, ValueError, KeyError, ET.ParseError) as e:
         print(f"  [arxiv] Error: {e}")
         return []
 

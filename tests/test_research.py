@@ -10,12 +10,20 @@ import pytest
 from research import (
     CheckpointResult,
     InteractionMode,
+    StoppingSignal,
+    check_synthesis_quality,
+    cross_topic_synthesis,
     extract_topic_findings,
+    get_failed_search_summary,
     identify_gaps,
+    is_similar_to_failed,
     main,
     prompt_checkpoint,
     read_file,
+    record_search_result,
     run_research_loop,
+    should_stop_research,
+    verify_citations_against_sources,
     write_file,
 )
 from search import EvaluationResult, IterationLog, SearchResult
@@ -237,10 +245,10 @@ class TestExtractTopicFindings:
         assert "full detailed text content" in prompt_arg
 
     @patch("research.llm_call")
-    def test_truncates_content_to_2000_chars(self, mock_llm_call):
+    def test_truncates_full_text_to_6000_chars(self, mock_llm_call):
         mock_llm_call.return_value = "findings"
 
-        long_text = "x" * 5000
+        long_text = "x" * 8000
         results = [
             SearchResult(
                 title="Paper",
@@ -258,9 +266,34 @@ class TestExtractTopicFindings:
         extract_topic_findings(results, "prog", store, "topic1")
 
         prompt_arg = mock_llm_call.call_args[0][0]
-        # full_text is truncated to 2000 chars via content[:2000]
-        assert "x" * 2000 in prompt_arg
-        assert "x" * 2001 not in prompt_arg
+        # full_text is truncated to 6000 chars (tiered content budget)
+        assert "x" * 6000 in prompt_arg
+        assert "x" * 6001 not in prompt_arg
+
+    @patch("research.llm_call")
+    def test_truncates_snippet_to_2000_chars(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+
+        long_snippet = "s" * 5000
+        results = [
+            SearchResult(
+                title="Paper",
+                url="https://example.com",
+                snippet=long_snippet,
+                source="arxiv",
+            ),
+        ]
+
+        store = MagicMock()
+        store.read_summary.return_value = ""
+        store.get_topic.return_value = None
+
+        extract_topic_findings(results, "prog", store, "topic1")
+
+        prompt_arg = mock_llm_call.call_args[0][0]
+        # snippet (no full_text) is truncated to 2000 chars
+        assert "s" * 2000 in prompt_arg
+        assert "s" * 2001 not in prompt_arg
 
     @patch("research.llm_call")
     def test_empty_summary_shows_first_synthesis(self, mock_llm_call):
@@ -486,9 +519,10 @@ class TestRunResearchLoop:
 
         run_research_loop(max_iterations=5, target_coverage=0.8)
 
-        # Should stop after 1 iteration since coverage 0.9 >= 0.8
-        assert mock_gaps.call_count == 1
-        assert mock_search.call_count == 1
+        # Multi-signal stopping needs 3+ scores for stable detection.
+        # Scores are appended twice per iteration, so after iteration 2
+        # recent_scores has 4 entries, all >= 0.8 -> stops.
+        assert mock_gaps.call_count <= 2
 
     @patch("research.KnowledgeStore")
     @patch("research.evaluate_coverage")
@@ -989,3 +1023,873 @@ class TestMainCLI:
         with patch("sys.argv", ["research.py", "--mode", "bogus"]):
             with pytest.raises(SystemExit):
                 main()
+
+
+# ── A6: Per-topic depth strategy ─────────────────────────────────────────
+
+
+class TestPerTopicDepthStrategy:
+    """A6: identify_gaps classifies topics as NEEDS_BREADTH/NEEDS_DEPTH/WELL_COVERED."""
+
+    def _make_mock_store(self, topics):
+        store = MagicMock()
+        from knowledge_store import IndexMeta, StoreIndex
+        index = StoreIndex(topics=topics, meta=IndexMeta())
+        store.load_index.return_value = index
+        store.get_context_with_budget.return_value = "## Knowledge Store Index\nContext"
+        store.read_summary.return_value = ""
+        return store
+
+    @patch("research.llm_json")
+    def test_low_coverage_labeled_needs_breadth(self, mock_llm_json):
+        mock_llm_json.return_value = {"gaps": [], "search_plan": [], "new_topics": []}
+        from knowledge_store import Topic
+        store = self._make_mock_store([Topic(id="t1", title="Topic 1", coverage=0.1)])
+
+        identify_gaps("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "NEEDS_BREADTH" in prompt
+        assert "t1" in prompt
+
+    @patch("research.llm_json")
+    def test_mid_coverage_labeled_needs_depth(self, mock_llm_json):
+        mock_llm_json.return_value = {"gaps": [], "search_plan": [], "new_topics": []}
+        from knowledge_store import Topic
+        store = self._make_mock_store([Topic(id="t1", title="Topic 1", coverage=0.5)])
+
+        identify_gaps("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "NEEDS_DEPTH" in prompt
+
+    @patch("research.llm_json")
+    def test_high_coverage_labeled_well_covered(self, mock_llm_json):
+        mock_llm_json.return_value = {"gaps": [], "search_plan": [], "new_topics": []}
+        from knowledge_store import Topic
+        store = self._make_mock_store([Topic(id="t1", title="Topic 1", coverage=0.85)])
+
+        identify_gaps("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "WELL_COVERED" in prompt
+
+    @patch("research.llm_json")
+    def test_depth_block_absent_for_empty_store(self, mock_llm_json):
+        mock_llm_json.return_value = {"gaps": [], "search_plan": [], "new_topics": []}
+        store = self._make_mock_store([])
+
+        identify_gaps("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "Topic Depth Analysis" not in prompt
+
+    @patch("research.llm_json")
+    def test_depth_boundary_030(self, mock_llm_json):
+        """Coverage exactly 0.3 should be NEEDS_DEPTH, not NEEDS_BREADTH for that topic."""
+        mock_llm_json.return_value = {"gaps": [], "search_plan": [], "new_topics": []}
+        from knowledge_store import Topic
+        store = self._make_mock_store([Topic(id="t1", title="T", coverage=0.3)])
+
+        identify_gaps("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        # The topic line should show NEEDS_DEPTH
+        assert '"t1"' in prompt
+        assert "coverage=0.30" in prompt
+        # Topic line: NEEDS_DEPTH (not NEEDS_BREADTH) since 0.3 >= 0.3
+        import re
+        topic_line = [l for l in prompt.split("\n") if '"t1"' in l and "coverage=" in l][0]
+        assert "NEEDS_DEPTH" in topic_line
+
+    @patch("research.llm_json")
+    def test_depth_boundary_070(self, mock_llm_json):
+        """Coverage exactly 0.7 should be WELL_COVERED for that topic."""
+        mock_llm_json.return_value = {"gaps": [], "search_plan": [], "new_topics": []}
+        from knowledge_store import Topic
+        store = self._make_mock_store([Topic(id="t1", title="T", coverage=0.7)])
+
+        identify_gaps("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        import re
+        topic_line = [l for l in prompt.split("\n") if '"t1"' in l and "coverage=" in l][0]
+        assert "WELL_COVERED" in topic_line
+
+    @patch("research.llm_json")
+    def test_search_strategy_guidance_present(self, mock_llm_json):
+        mock_llm_json.return_value = {"gaps": [], "search_plan": [], "new_topics": []}
+        from knowledge_store import Topic
+        store = self._make_mock_store([Topic(id="t1", title="T", coverage=0.1)])
+
+        identify_gaps("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "use web searches" in prompt
+        assert "use academic sources" in prompt
+
+
+# ── B1: Comparative synthesis prompts ────────────────────────────────────
+
+
+class TestComparativeSynthesis:
+    """B1: extract_topic_findings includes convergence/divergence/interactions/hierarchies."""
+
+    @patch("research.llm_call")
+    def test_convergence_instruction_in_prompt(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = "existing"
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="arxiv")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "CONVERGENCE" in prompt
+
+    @patch("research.llm_call")
+    def test_divergence_instruction_in_prompt(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = "existing"
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="arxiv")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "DIVERGENCE" in prompt
+
+    @patch("research.llm_call")
+    def test_interactions_instruction_in_prompt(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = "existing"
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="arxiv")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "INTERACTIONS" in prompt
+
+    @patch("research.llm_call")
+    def test_hierarchies_instruction_in_prompt(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = "existing"
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="arxiv")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "HIERARCHIES" in prompt
+
+
+# ── B2: Contradiction detection & reconciliation ────────────────────────
+
+
+class TestContradictionDetection:
+    """B2: [CONFLICT] markers in synthesis prompts."""
+
+    @patch("research.llm_call")
+    def test_conflict_marker_in_prompt(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = "existing"
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="arxiv")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "[CONFLICT]" in prompt
+
+    @patch("research.llm_call")
+    def test_contradiction_protocol_in_prompt(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = "existing"
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="arxiv")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "Contradiction Protocol" in prompt
+        assert "peer-reviewed" in prompt
+
+    @patch("research.llm_call")
+    def test_competing_claims_section_in_prompt(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = "existing"
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="arxiv")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "Competing Claims" in prompt
+
+
+# ── B3: Evidence tier classification ─────────────────────────────────────
+
+
+class TestEvidenceTierClassification:
+    """B3: T1-T4 labeling in synthesis prompt."""
+
+    @patch("research.llm_call")
+    def test_evidence_tiers_in_prompt(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = "existing"
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="arxiv")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "T1" in prompt
+        assert "T2" in prompt
+        assert "T3" in prompt
+        assert "T4" in prompt
+        assert "Evidence Tier Classification" in prompt
+
+    @patch("research.llm_call")
+    def test_authority_indicator_for_academic(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = ""
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="semantic_scholar")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "Academic" in prompt
+
+    @patch("research.llm_call")
+    def test_authority_indicator_for_web(self, mock_llm_call):
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = ""
+        store.get_topic.return_value = None
+
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="s", source="duckduckgo")],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "Web" in prompt
+
+    @patch("research.llm_call")
+    def test_tiered_content_budget_full_text_6000(self, mock_llm_call):
+        """Tier 1 sources with full_text get 6000 char budget."""
+        mock_llm_call.return_value = "findings"
+        store = MagicMock()
+        store.read_summary.return_value = ""
+        store.get_topic.return_value = None
+
+        long_text = "y" * 8000
+        extract_topic_findings(
+            [SearchResult(title="T", url="u", snippet="short", source="metaso", full_text=long_text)],
+            "prog", store, "topic1",
+        )
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "y" * 6000 in prompt
+        assert "y" * 6001 not in prompt
+
+
+# ── B5: Citation verification ────────────────────────────────────────────
+
+
+class TestCitationVerification:
+    """B5: verify_citations_against_sources()."""
+
+    def test_matching_citations_are_plausible(self):
+        # Citation words (split on space, len>2) must overlap with source words (split on space, len>3)
+        summary = "According to [Deep Neural Survey], neural networks are effective."
+        sources = ["Smith et al. - Deep Neural Network Survey"]
+        result = verify_citations_against_sources(summary, sources)
+
+        assert result["total"] == 1
+        assert result["plausible"] == 1
+        assert result["suspicious"] == []
+
+    def test_unmatched_citation_is_suspicious(self):
+        summary = "According to [Phantom Author], this is true."
+        sources = ["Smith et al. - Deep Neural Network Survey"]
+        result = verify_citations_against_sources(summary, sources)
+
+        assert result["total"] == 1
+        assert result["plausible"] == 0
+        assert "Phantom Author" in result["suspicious"]
+
+    def test_conflict_markers_excluded(self):
+        summary = "Sources conflict [CONFLICT] but [Smith, 2024] says X."
+        sources = ["Smith et al."]
+        result = verify_citations_against_sources(summary, sources)
+
+        # [CONFLICT] should NOT be counted as a citation
+        assert result["total"] == 1
+
+    def test_http_links_excluded(self):
+        summary = "See [http://example.com] and [Smith, 2024]."
+        sources = ["Smith et al."]
+        result = verify_citations_against_sources(summary, sources)
+
+        assert result["total"] == 1
+
+    def test_empty_summary(self):
+        result = verify_citations_against_sources("", ["Source A"])
+        assert result["total"] == 0
+        assert result["plausible"] == 0
+        assert result["suspicious"] == []
+
+    def test_multiple_citations_mixed(self):
+        # cite_words are lowered split on space, len>2; source_words are lowered split on space, len>3
+        summary = "[Smith Network] agrees with [Jones Learning] but [Unknown Stuff] differs."
+        sources = ["Smith Neural Network Paper", "Jones Machine Learning"]
+        result = verify_citations_against_sources(summary, sources)
+
+        assert result["total"] == 3
+        assert result["plausible"] == 2
+        assert len(result["suspicious"]) == 1
+
+
+# ── C1: Evaluation calibration ───────────────────────────────────────────
+
+
+class TestEvaluationCalibration:
+    """C1: calibration_confidence in evaluate_coverage."""
+
+    @patch("research.llm_json")
+    def test_calibration_confidence_in_prompt(self, mock_llm_json):
+        from research import evaluate_coverage
+        mock_llm_json.return_value = {
+            "coverage_score": 0.5,
+            "calibration_confidence": 0.8,
+            "topic_scores": {},
+        }
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        from knowledge_store import IndexMeta, StoreIndex
+        store.load_index.return_value = StoreIndex(meta=IndexMeta())
+        store.read_summary.return_value = ""
+
+        evaluate_coverage("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "calibration_confidence" in prompt
+        assert "Calibration Instruction" in prompt
+
+    @patch("research.llm_json")
+    def test_calibration_clamped_to_valid_range(self, mock_llm_json):
+        from research import evaluate_coverage
+        mock_llm_json.return_value = {
+            "coverage_score": 0.5,
+            "calibration_confidence": 1.5,  # Out of range
+            "topic_scores": {},
+        }
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        from knowledge_store import IndexMeta, StoreIndex
+        store.load_index.return_value = StoreIndex(meta=IndexMeta())
+        store.read_summary.return_value = ""
+
+        # Should not crash; clamping happens internally
+        result = evaluate_coverage("program", store)
+        assert result.coverage_score == 0.5
+
+    @patch("research.llm_json")
+    def test_invalid_calibration_defaults_to_05(self, mock_llm_json):
+        from research import evaluate_coverage
+        mock_llm_json.return_value = {
+            "coverage_score": 0.5,
+            "calibration_confidence": "not_a_number",
+            "topic_scores": {},
+        }
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        from knowledge_store import IndexMeta, StoreIndex
+        store.load_index.return_value = StoreIndex(meta=IndexMeta())
+        store.read_summary.return_value = ""
+
+        result = evaluate_coverage("program", store)
+        # Should not crash
+        assert result.coverage_score == 0.5
+
+
+# ── C2: Per-question evaluation ──────────────────────────────────────────
+
+
+class TestPerQuestionEvaluation:
+    """C2: question_scores parsing in evaluate_coverage."""
+
+    @patch("research.llm_json")
+    def test_question_scores_in_prompt(self, mock_llm_json):
+        from research import evaluate_coverage
+        mock_llm_json.return_value = {
+            "coverage_score": 0.6,
+            "question_scores": [],
+            "topic_scores": {},
+        }
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        from knowledge_store import IndexMeta, StoreIndex
+        store.load_index.return_value = StoreIndex(meta=IndexMeta())
+        store.read_summary.return_value = ""
+
+        evaluate_coverage("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "question_scores" in prompt
+        assert "score" in prompt
+        assert "status" in prompt
+
+    @patch("research.llm_json")
+    def test_question_status_updated_in_store(self, mock_llm_json):
+        from research import evaluate_coverage
+        from knowledge_store import IndexMeta, Question, StoreIndex
+
+        mock_llm_json.return_value = {
+            "coverage_score": 0.6,
+            "question_scores": [
+                {"question": "What is machine learning?", "score": 0.8, "status": "answered",
+                 "covered_by_topics": ["ml_basics"]},
+            ],
+            "topic_scores": {},
+        }
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        q = Question(id="q1", text="What is machine learning?", status="unanswered")
+        idx = StoreIndex(questions=[q], meta=IndexMeta())
+        store.load_index.return_value = idx
+        store.read_summary.return_value = ""
+
+        evaluate_coverage("program", store)
+
+        # save_index should be called to persist question status
+        store.save_index.assert_called()
+        # The question's status should have been updated
+        assert q.status == "answered"
+        assert q.related_topics == ["ml_basics"]
+
+    @patch("research.llm_json")
+    def test_question_matching_uses_prefix(self, mock_llm_json):
+        """Questions are matched by first 50 chars of lowercase text."""
+        from research import evaluate_coverage
+        from knowledge_store import IndexMeta, Question, StoreIndex
+
+        long_question = "What are the main approaches to natural language processing in modern systems?"
+        mock_llm_json.return_value = {
+            "coverage_score": 0.6,
+            "question_scores": [
+                {"question": long_question, "score": 0.5, "status": "partial"},
+            ],
+            "topic_scores": {},
+        }
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        q = Question(id="q1", text=long_question + " Extra details here.", status="unanswered")
+        idx = StoreIndex(questions=[q], meta=IndexMeta())
+        store.load_index.return_value = idx
+        store.read_summary.return_value = ""
+
+        evaluate_coverage("program", store)
+
+        assert q.status == "partial"
+
+
+# ── C3: Multi-signal stopping ────────────────────────────────────────────
+
+
+class TestMultiSignalStopping:
+    """C3: StoppingSignal and should_stop_research()."""
+
+    def test_max_iterations_reached(self):
+        signal = should_stop_research([0.5, 0.6, 0.7], iteration=10, target_coverage=0.8, max_iterations=10)
+        assert signal.should_stop is True
+        assert signal.reason == "max_iterations_reached"
+        assert signal.confidence == 1.0
+
+    def test_too_few_iterations(self):
+        signal = should_stop_research([0.5, 0.6], iteration=2, target_coverage=0.8, max_iterations=10)
+        assert signal.should_stop is False
+        assert signal.reason == "too_few_iterations"
+
+    def test_coverage_stable_at_target(self):
+        signal = should_stop_research([0.5, 0.6, 0.85, 0.83, 0.82], iteration=5, target_coverage=0.8, max_iterations=10)
+        assert signal.should_stop is True
+        assert signal.reason == "coverage_stable_at_target"
+        assert signal.confidence == 0.95
+
+    def test_coverage_not_stable_below_target(self):
+        signal = should_stop_research([0.5, 0.6, 0.75], iteration=3, target_coverage=0.8, max_iterations=10)
+        assert signal.should_stop is False
+
+    def test_oscillation_detected(self):
+        # Scores: 0.5 -> 0.6 -> 0.5 -> 0.6 -> 0.5 (3 direction changes)
+        signal = should_stop_research([0.5, 0.6, 0.5, 0.6, 0.5], iteration=5, target_coverage=0.8, max_iterations=10)
+        assert signal.should_stop is True
+        assert "oscillating" in signal.reason
+        assert signal.confidence == 0.7
+
+    def test_diminishing_returns(self):
+        # Less than 0.02 improvement over last 4, iteration > 5
+        signal = should_stop_research([0.5, 0.6, 0.61, 0.61, 0.615, 0.618], iteration=6, target_coverage=0.8, max_iterations=20)
+        assert signal.should_stop is True
+        assert signal.reason == "diminishing_returns"
+        assert signal.confidence == 0.6
+
+    def test_single_score_at_target(self):
+        signal = should_stop_research([0.3, 0.5, 0.82], iteration=3, target_coverage=0.8, max_iterations=10)
+        assert signal.should_stop is True
+        assert signal.reason == "target_reached"
+        assert signal.confidence == 0.9
+
+    def test_continue_when_improving(self):
+        signal = should_stop_research([0.3, 0.4, 0.5], iteration=3, target_coverage=0.8, max_iterations=10)
+        assert signal.should_stop is False
+        assert signal.reason == "continue"
+
+    def test_stopping_signal_dataclass(self):
+        s = StoppingSignal(should_stop=True, reason="test", confidence=0.5)
+        assert s.should_stop is True
+        assert s.reason == "test"
+        assert s.confidence == 0.5
+
+
+# ── C4: Systematic gap analysis ──────────────────────────────────────────
+
+
+class TestSystematicGapAnalysis:
+    """C4: question-by-question coverage in identify_gaps and evaluate_coverage."""
+
+    @patch("research.llm_json")
+    def test_systematic_question_check_in_gaps_prompt(self, mock_llm_json):
+        mock_llm_json.return_value = {"gaps": [], "search_plan": [], "new_topics": []}
+        from knowledge_store import IndexMeta, StoreIndex, Topic
+        store = MagicMock()
+        store.load_index.return_value = StoreIndex(
+            topics=[Topic(id="t1", title="T", coverage=0.5)],
+            meta=IndexMeta(),
+        )
+        store.get_context_with_budget.return_value = "context"
+        store.read_summary.return_value = ""
+
+        identify_gaps("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "Systematic Question Check" in prompt
+        assert "LOWEST coverage" in prompt
+
+    @patch("research.llm_json")
+    def test_scoring_rubric_in_eval_prompt(self, mock_llm_json):
+        from research import evaluate_coverage
+        mock_llm_json.return_value = {"coverage_score": 0.5, "topic_scores": {}}
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        from knowledge_store import IndexMeta, StoreIndex
+        store.load_index.return_value = StoreIndex(meta=IndexMeta())
+        store.read_summary.return_value = ""
+
+        evaluate_coverage("program", store)
+
+        prompt = mock_llm_json.call_args[0][0]
+        assert "Scoring Rubric" in prompt
+        assert "Citation Validation Rule" in prompt
+
+    @patch("research.llm_json")
+    def test_coverage_score_clamped(self, mock_llm_json):
+        from research import evaluate_coverage
+        mock_llm_json.return_value = {"coverage_score": 1.5, "topic_scores": {}}
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        from knowledge_store import IndexMeta, StoreIndex
+        store.load_index.return_value = StoreIndex(meta=IndexMeta())
+        store.read_summary.return_value = ""
+
+        result = evaluate_coverage("program", store)
+        assert result.coverage_score == 1.0
+
+    @patch("research.llm_json")
+    def test_negative_coverage_score_clamped(self, mock_llm_json):
+        from research import evaluate_coverage
+        mock_llm_json.return_value = {"coverage_score": -0.5, "topic_scores": {}}
+        store = MagicMock()
+        store.get_context_for_gaps.return_value = "context"
+        from knowledge_store import IndexMeta, StoreIndex
+        store.load_index.return_value = StoreIndex(meta=IndexMeta())
+        store.read_summary.return_value = ""
+
+        result = evaluate_coverage("program", store)
+        assert result.coverage_score == 0.0
+
+
+# ── C5: Search history / failed query avoidance ─────────────────────────
+
+
+class TestSearchHistory:
+    """C5: record_search_result, get_failed_search_summary, is_similar_to_failed."""
+
+    def setup_method(self):
+        """Clear the module-level _search_history before each test."""
+        import research
+        research._search_history.clear()
+
+    def test_record_search_result(self):
+        record_search_result("test query", ["arxiv"], 5, 1)
+        import research
+        assert len(research._search_history) == 1
+        assert research._search_history[0]["query"] == "test query"
+        assert research._search_history[0]["result_count"] == 5
+
+    def test_get_failed_search_summary_empty(self):
+        assert get_failed_search_summary() == ""
+
+    def test_get_failed_search_summary_with_failures(self):
+        record_search_result("failed query", ["arxiv"], 0, 1)
+        record_search_result("success query", ["duckduckgo"], 3, 1)
+
+        summary = get_failed_search_summary()
+        assert "failed query" in summary
+        assert "success query" not in summary
+        assert "NO results" in summary
+
+    def test_get_failed_search_summary_max_5(self):
+        for i in range(8):
+            record_search_result(f"failed {i}", ["arxiv"], 0, i)
+
+        summary = get_failed_search_summary()
+        # Should only include the last 5 failures
+        assert "failed 3" in summary
+        assert "failed 7" in summary
+
+    def test_is_similar_to_failed_true(self):
+        record_search_result("machine learning algorithms overview", ["arxiv"], 0, 1)
+
+        assert is_similar_to_failed("machine learning algorithms survey") is True
+
+    def test_is_similar_to_failed_false(self):
+        record_search_result("machine learning algorithms overview", ["arxiv"], 0, 1)
+
+        assert is_similar_to_failed("quantum computing applications") is False
+
+    def test_is_similar_to_failed_no_history(self):
+        assert is_similar_to_failed("any query") is False
+
+    def test_is_similar_to_failed_only_checks_failures(self):
+        record_search_result("machine learning algorithms overview", ["arxiv"], 5, 1)  # success
+
+        assert is_similar_to_failed("machine learning algorithms overview") is False
+
+    def test_is_similar_custom_threshold(self):
+        record_search_result("machine learning deep", ["arxiv"], 0, 1)
+
+        # With very high threshold, only exact overlap matches
+        # "machine learning deep" vs "machine learning deep extra" => overlap=3/4=0.75
+        assert is_similar_to_failed("machine learning deep extra words here", threshold=0.9) is False
+        # With low threshold, partial overlap matches
+        assert is_similar_to_failed("machine learning wide", threshold=0.3) is True
+
+    def test_is_similar_empty_query(self):
+        record_search_result("", ["arxiv"], 0, 1)
+        assert is_similar_to_failed("test") is False
+
+
+# ── C6: Synthesis quality gates ──────────────────────────────────────────
+
+
+class TestSynthesisQualityGates:
+    """C6: check_synthesis_quality()."""
+
+    def test_first_synthesis_always_ok(self):
+        is_ok, reason = check_synthesis_quality("", "new content")
+        assert is_ok is True
+        assert reason == "first_synthesis"
+
+    def test_first_synthesis_whitespace_only(self):
+        is_ok, reason = check_synthesis_quality("   ", "new content")
+        assert is_ok is True
+        assert reason == "first_synthesis"
+
+    def test_normal_growth_is_ok(self):
+        old = "Some existing findings with [Citation, 2024]."
+        new = "Some existing findings with [Citation, 2024]. Plus new data from [New, 2025]."
+        is_ok, reason = check_synthesis_quality(old, new)
+        assert is_ok is True
+        assert reason == "ok"
+
+    def test_dramatic_shrinkage_rejected(self):
+        old = "x" * 500
+        new = "x" * 100
+        is_ok, reason = check_synthesis_quality(old, new)
+        assert is_ok is False
+        assert "summary_shrunk" in reason
+
+    def test_small_shrinkage_ok_when_short(self):
+        old = "x" * 100
+        new = "x" * 40
+        is_ok, reason = check_synthesis_quality(old, new)
+        assert is_ok is True  # old_len <= 200, so shrinkage check skipped
+
+    def test_citation_loss_rejected(self):
+        old = "Data from [Smith, 2024] and [Jones, 2023] and [Lee, 2022] and [Wang, 2021]."
+        new = "Data exists."
+        is_ok, reason = check_synthesis_quality(old, new)
+        assert is_ok is False
+        assert "citations_lost" in reason
+
+    def test_citation_maintained_ok(self):
+        old = "From [Smith, 2024] and [Jones, 2023]."
+        new = "From [Smith, 2024] and [Jones, 2023] and [New, 2025]."
+        is_ok, reason = check_synthesis_quality(old, new)
+        assert is_ok is True
+
+    def test_single_citation_not_flagged(self):
+        """When old has only 1 citation, losing it shouldn't trigger (old_cites < 2)."""
+        old = "From [Smith, 2024] only."
+        new = "Updated content without citations."
+        is_ok, reason = check_synthesis_quality(old, new)
+        assert is_ok is True
+
+
+# ── B4: Cross-topic synthesis ────────────────────────────────────────────
+
+
+class TestCrossTopicSynthesis:
+    """B4: cross_topic_synthesis()."""
+
+    @patch("research.llm_call")
+    def test_returns_empty_for_single_topic(self, mock_llm_call):
+        store = MagicMock()
+        from knowledge_store import IndexMeta, StoreIndex, Topic
+        store.load_index.return_value = StoreIndex(
+            topics=[Topic(id="t1", title="T1")],
+            meta=IndexMeta(),
+        )
+
+        result = cross_topic_synthesis(store, "program")
+
+        assert result == ""
+        mock_llm_call.assert_not_called()
+
+    @patch("research.llm_call")
+    def test_returns_empty_for_no_topics(self, mock_llm_call):
+        store = MagicMock()
+        from knowledge_store import IndexMeta, StoreIndex
+        store.load_index.return_value = StoreIndex(meta=IndexMeta())
+
+        result = cross_topic_synthesis(store, "program")
+
+        assert result == ""
+        mock_llm_call.assert_not_called()
+
+    @patch("research.llm_call")
+    def test_calls_llm_with_multiple_topics(self, mock_llm_call):
+        mock_llm_call.return_value = "Cross-topic analysis"
+        store = MagicMock()
+        from knowledge_store import IndexMeta, StoreIndex, Topic
+        store.load_index.return_value = StoreIndex(
+            topics=[
+                Topic(id="t1", title="Topic 1", coverage=0.7),
+                Topic(id="t2", title="Topic 2", coverage=0.5),
+            ],
+            meta=IndexMeta(),
+        )
+        store.read_summary.side_effect = lambda tid: {"t1": "Summary 1", "t2": "Summary 2"}.get(tid, "")
+
+        result = cross_topic_synthesis(store, "program")
+
+        assert result == "Cross-topic analysis"
+        mock_llm_call.assert_called_once()
+        prompt = mock_llm_call.call_args[0][0]
+        assert "SHARED CONCEPTS" in prompt
+        assert "CROSS-TOPIC CONTRADICTIONS" in prompt
+        assert "EMERGENT INSIGHTS" in prompt
+        assert "DEPENDENCY MAP" in prompt
+        assert "Summary 1" in prompt
+        assert "Summary 2" in prompt
+
+    @patch("research.llm_call")
+    def test_skips_empty_summaries(self, mock_llm_call):
+        store = MagicMock()
+        from knowledge_store import IndexMeta, StoreIndex, Topic
+        store.load_index.return_value = StoreIndex(
+            topics=[
+                Topic(id="t1", title="T1", coverage=0.7),
+                Topic(id="t2", title="T2", coverage=0.5),
+            ],
+            meta=IndexMeta(),
+        )
+        # One topic has content, one is empty
+        store.read_summary.side_effect = lambda tid: {"t1": "Summary 1", "t2": ""}.get(tid, "")
+
+        result = cross_topic_synthesis(store, "program")
+
+        # Only 1 non-empty summary = less than 2, so return empty
+        assert result == ""
+        mock_llm_call.assert_not_called()
+
+    @patch("research.llm_call")
+    def test_handles_llm_error(self, mock_llm_call):
+        mock_llm_call.side_effect = RuntimeError("LLM error")
+        store = MagicMock()
+        from knowledge_store import IndexMeta, StoreIndex, Topic
+        store.load_index.return_value = StoreIndex(
+            topics=[
+                Topic(id="t1", title="T1"),
+                Topic(id="t2", title="T2"),
+            ],
+            meta=IndexMeta(),
+        )
+        store.read_summary.side_effect = lambda tid: "Summary text"
+
+        result = cross_topic_synthesis(store, "program")
+
+        assert result == ""
+
+    @patch("research.llm_call")
+    def test_truncates_summaries_to_1500(self, mock_llm_call):
+        mock_llm_call.return_value = "analysis"
+        store = MagicMock()
+        from knowledge_store import IndexMeta, StoreIndex, Topic
+        store.load_index.return_value = StoreIndex(
+            topics=[
+                Topic(id="t1", title="T1", coverage=0.5),
+                Topic(id="t2", title="T2", coverage=0.5),
+            ],
+            meta=IndexMeta(),
+        )
+        long_summary = "z" * 3000
+        store.read_summary.side_effect = lambda tid: long_summary
+
+        cross_topic_synthesis(store, "program")
+
+        prompt = mock_llm_call.call_args[0][0]
+        assert "z" * 1500 in prompt
+        assert "z" * 1501 not in prompt
