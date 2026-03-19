@@ -34,6 +34,7 @@ LLM_TIMEOUT = int(os.environ.get("AUTORESEARCH_LLM_TIMEOUT", "120"))
 #   "openai/gpt-4o"                  → OpenAI
 #   "deepseek/deepseek-chat"         → DeepSeek
 #   "gemini/gemini-2.0-flash"        → Google Gemini
+#   "GLM-5-Turbo"                    → Zhipu GLM
 
 PROVIDER_CONFIG = {
     "anthropic": {
@@ -51,6 +52,10 @@ PROVIDER_CONFIG = {
     "gemini": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
         "env_key": "GOOGLE_API_KEY",
+    },
+    "glm": {
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        "env_key": "GLM_API_KEY",
     },
 }
 
@@ -70,6 +75,8 @@ def _detect_provider(model: str) -> Tuple[str, str]:
         return "deepseek", model
     if model.startswith("gemini"):
         return "gemini", model
+    if model.startswith("glm") or model.startswith("GLM"):
+        return "glm", model
 
     # Default to OpenAI-compatible
     return "openai", model
