@@ -57,6 +57,14 @@ PROVIDER_CONFIG = {
         "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
         "env_key": "GLM_API_KEY",
     },
+    "dashscope": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "env_key": "DASHSCOPE_API_KEY",
+    },
+    "minimax": {
+        "base_url": "https://api.minimax.chat/v1/chat/completions",
+        "env_key": "MINIMAX_API_KEY",
+    },
 }
 
 
@@ -77,6 +85,10 @@ def _detect_provider(model: str) -> Tuple[str, str]:
         return "gemini", model
     if model.startswith("glm") or model.startswith("GLM"):
         return "glm", model
+    if model.startswith("qwen"):
+        return "dashscope", model
+    if model.startswith("minimax") or model.startswith("MiniMax"):
+        return "minimax", model
 
     # Default to OpenAI-compatible
     return "openai", model
@@ -273,8 +285,8 @@ def validate_query_sources(query: str, sources: List[str]) -> List[str]:
 
     # Recent events query should include web search
     if query_words & _RECENT_KEYWORDS:
-        if "duckduckgo" not in adjusted:
-            adjusted.append("duckduckgo")
+        if "metaso" not in adjusted:
+            adjusted.append("metaso")
 
     return adjusted
 
@@ -775,7 +787,7 @@ def execute_searches(
 
     for plan in queries:
         query = plan["query"]
-        sources = plan.get("sources", ["duckduckgo"])
+        sources = plan.get("sources", ["metaso"])
         for src in sources:
             # A3: Check source exhaustion
             if is_source_exhausted(src):
