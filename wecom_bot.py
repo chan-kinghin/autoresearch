@@ -84,6 +84,8 @@ class TaskInfo:
     work_dir: Path
     response_url: str = ""
     notified: bool = False  # True once completion/error notification was sent
+    last_activity: str = ""
+    last_activity_sent: float = 0.0
 
 
 _running_tasks: dict[str, TaskInfo] = {}
@@ -1033,8 +1035,8 @@ def handle_message(text: str, from_user: str, response_url: str = "", webhook_ke
                     matched_key = matched[0]
                     with _tasks_lock:
                         info = _running_tasks.get(matched_key)
-                    # Ownership check: only the creator can cancel
-                    if info and info.from_user and from_user and info.from_user != from_user:
+                    # Ownership check: only the creator can cancel (deny if sender unknown)
+                    if info and info.from_user and (not from_user or info.from_user != from_user):
                         reply_message(
                             f"⚠️ 该任务由 {info.from_user} 创建，只有创建者可以取消。",
                             response_url, webhook_key,
@@ -1347,7 +1349,7 @@ class WeComBotHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        body = self.rfile.read(content_length).decode("utf-8")
+        body = self.rfile.read(content_length).decode("utf-8", errors="replace")
 
         # Respond immediately (WeCom expects quick 200)
         self.send_response(200)
@@ -1394,7 +1396,6 @@ class WeComBotHandler(BaseHTTPRequestHandler):
         # Fallback: try plaintext JSON (for testing only)
         if DEBUG:
             try:
-                data = json.loads(body)
                 msg = _extract_message(body)
                 if msg["text"]:
                     handle_message(msg["text"], msg["from_user"], msg["response_url"], BOT_KEY)

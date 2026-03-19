@@ -1051,9 +1051,6 @@ def run_research_loop(
             human_guidance = cp2.guidance  # Carry to next iteration's identify_gaps()
             print(f"  Guidance noted for next iteration: \"{human_guidance}\"")
 
-        # Track scores for stopping analysis
-        recent_scores.append(evaluation.coverage_score)
-
         # Step 7: Multi-signal stopping (C3)
         stop_signal = should_stop_research(recent_scores, iteration, target_coverage, max_iterations)
         if stop_signal.should_stop:
