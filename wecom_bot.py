@@ -343,6 +343,36 @@ def send_wecom_file(webhook_key: str, file_path: Path) -> bool:
 
 # ── Research runner ──────────────────────────────────────────────────────
 
+_PARAM_RE = re.compile(
+    r"(?:--|—)"                         # long dash or double hyphen
+    r"(iter(?:ations?)?|cov(?:erage)?)"  # param name
+    r"[\s=:]?"                           # optional separator
+    r"(\d+(?:\.\d+)?)",                  # numeric value
+    re.IGNORECASE,
+)
+
+
+def _parse_research_params(topic: str) -> tuple[str, int, float]:
+    """Extract optional --iter N / --cov X.X from a topic string.
+
+    Returns (clean_topic, max_iterations, target_coverage).
+    """
+    max_iter = DEFAULT_MAX_ITER
+    target_cov = DEFAULT_TARGET_COVERAGE
+
+    for m in _PARAM_RE.finditer(topic):
+        name = m.group(1).lower()
+        value = m.group(2)
+        if name.startswith("iter"):
+            max_iter = max(1, min(int(value), 20))
+        elif name.startswith("cov"):
+            target_cov = max(0.1, min(float(value), 1.0))
+
+    clean = _PARAM_RE.sub("", topic).strip()
+    # Collapse any leftover double spaces
+    clean = re.sub(r"\s{2,}", " ", clean)
+    return clean, max_iter, target_cov
+
 
 def generate_research_program(topic: str) -> str:
     """Generate a research program markdown from a topic string."""
